@@ -42,8 +42,8 @@ class StringRef;
     /// Check whether there are differences.
     virtual bool hadDifferences() const = 0;
 
-    /// Clear differences.
-    virtual void clearDifferences() = 0;
+    /// Reset differences.
+    virtual void reset() = 0;
 
     /// Record a difference within the current context.
     virtual void log(StringRef Text) = 0;
@@ -85,8 +85,8 @@ class StringRef;
       : out(out), Differences(false), Indent(0) {}
     ~DiffConsumer() override {}
 
+    void reset() override;
     bool hadDifferences() const override;
-    void clearDifferences() override;
     void enterContext(const Value *L, const Value *R) override;
     void exitContext() override;
     void log(StringRef text) override;

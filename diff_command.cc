@@ -188,9 +188,9 @@ std::error_code DistillDiffFunctions(DiffConsumer *consumer, Module *original,
 		if (consumer->hadDifferences()) {
 			klp_func_set.insert(&RFn);
 
-			// Now, the diff flag is dirty. Clear it to detect new differences
-			// for next c functions in the 'patched'.
-			consumer->clearDifferences();
+			// Reset the consumer to detect new differences for the
+			// next C function in the patched file.
+			consumer->reset();
 		}
 	}
 

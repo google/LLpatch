@@ -138,8 +138,10 @@ bool DiffConsumer::hadDifferences() const {
   return Differences;
 }
 
-void DiffConsumer::clearDifferences() {
+void DiffConsumer::reset() {
+  contexts.clear();
   Differences = false;
+  Indent = 0;
 }
 
 void DiffConsumer::enterContext(const Value *L, const Value *R) {
