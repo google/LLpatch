@@ -35,7 +35,8 @@
 
 using namespace llvm;
 
-namespace {
+namespace
+{
 StringRef kKLPLocalSym("klp.local.sym");
 
 void throw_gelf_error()
@@ -144,7 +145,8 @@ void ElfSymbol::GetGElfSymbol(GElf_Sym *sym) const noexcept(false)
 	GetGElfSymbol(sym, sym_cursor_);
 }
 
-void ElfSymbol::GetGElfSymbol(GElf_Sym *sym, size_t cursor) const noexcept(false)
+void ElfSymbol::GetGElfSymbol(GElf_Sym *sym, size_t cursor) const
+	noexcept(false)
 {
 	if (cursor == std::numeric_limits<size_t>::max()) {
 		errs() << "sym cursor, " << cursor << ", is invalid\n";
@@ -171,8 +173,7 @@ void ElfSymbol::SetGElfSymbol(GElf_Sym *sym, size_t cursor) noexcept(false)
 
 bool ElfSymbol::IsKLPLocalSymbol() const noexcept(false)
 {
-	return StringRef(Name()).
-		startswith(Twine(kKLPLocalSym, ":").str());
+	return StringRef(Name()).startswith(Twine(kKLPLocalSym, ":").str());
 }
 
 std::string ElfSymbol::CreateKlpLocalSymName(StringRef sym_name)
@@ -180,18 +181,19 @@ std::string ElfSymbol::CreateKlpLocalSymName(StringRef sym_name)
 	return (Twine(kKLPLocalSym, ":") + Twine(sym_name)).str();
 }
 
-
-namespace {
+namespace
+{
 std::string RemoveBasePath(StringRef path, StringRef base_path)
 {
 	return path.split(base_path).second.ltrim("./").str();
 }
-}
+} // namespace
 
-std::string ElfSymbol::CreateLivepatchedFunctionName(const Function &fn, StringRef base_path)
+std::string ElfSymbol::CreateLivepatchedFunctionName(const Function &fn,
+						     StringRef base_path)
 {
 	return fn.getName().str() + ":" +
-		RemoveBasePath(fn.getParent()->getSourceFileName(), base_path);
+	       RemoveBasePath(fn.getParent()->getSourceFileName(), base_path);
 }
 
 // CreateLivepatchedSymbolName - Create a unique name for the global. The
@@ -210,7 +212,7 @@ std::string ElfSymbol::CreateLivepatchedSymbolName(StringRef orig_name,
 						   StringRef base_path)
 {
 	return ElfSymbol::CreateKlpLocalSymName(orig_name) + ":" +
-		RemoveBasePath(filename, base_path);
+	       RemoveBasePath(filename, base_path);
 }
 
 ElfSymbol::Iterator::Iterator(ElfSymbol *symbol) noexcept(false)

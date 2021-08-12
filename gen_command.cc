@@ -191,7 +191,7 @@ std::error_code GenCommand::Run()
 	// functions are required. Iterate through all symbols in ELF and get
 	// the names. A name of livepatched function has a special prefix,
 	// kLivepatchPrefixElf.
-	std::vector<std::pair<StringRef, StringRef>> klp_func_names;
+	std::vector<std::pair<StringRef, StringRef> > klp_func_names;
 	ElfBin elf_bin(klp_patch_filename_);
 	size_t prefix_len = kLivepatchPrefixElf.length();
 	for (ElfSymbol *i : elf_bin.Symbols()) {
@@ -201,15 +201,18 @@ std::error_code GenCommand::Run()
 			continue;
 		}
 
-		if (symbol.substr(1).find(kLivepatchPrefixElf) != std::string::npos) {
+		if (symbol.substr(1).find(kLivepatchPrefixElf) !=
+		    std::string::npos) {
 			// This means kLivepatchPrefixElf is matched in the middle of
 			// string. This is not expected. error out.
 			errs() << "symbol name: " << symbol << "\n";
 			return ElfErrorCode::INVALID_KLP_PREFIX;
 		}
 
-		auto [func_name, src_file] = symbol.drop_front(prefix_len).split(':');
-		klp_func_names.emplace_back(std::make_pair(func_name, src_file));
+		auto [func_name, src_file] =
+			symbol.drop_front(prefix_len).split(':');
+		klp_func_names.emplace_back(
+			std::make_pair(func_name, src_file));
 	}
 
 	if (klp_func_names.empty()) {
@@ -242,9 +245,9 @@ std::error_code GenCommand::Run()
 	return ErrorCode::NO_ERROR;
 }
 
-std::error_code
-GenCommand::GenerateWrapper(const std::vector<std::pair<StringRef, StringRef>> &klp_func_names,
-			    const std::string &mod_name)
+std::error_code GenCommand::GenerateWrapper(
+	const std::vector<std::pair<StringRef, StringRef> > &klp_func_names,
+	const std::string &mod_name)
 {
 	static constexpr std::string_view kWrapperName = "livepatch.c";
 	static constexpr std::string_view kFuncMarker =
@@ -269,10 +272,8 @@ GenCommand::GenerateWrapper(const std::vector<std::pair<StringRef, StringRef>> &
 	DumpToMarker(tmpl_file, out_file, kFuncMarker);
 	for (auto [func_name, src_file] : klp_func_names) {
 		// void livepatch_${name_of_func}(void)
-		out_file << "void "
-			 << std::string(kLivepatchPrefixTmpl)
-			 << func_name.str()
-			 << "(void);\n";
+		out_file << "void " << std::string(kLivepatchPrefixTmpl)
+			 << func_name.str() << "(void);\n";
 	}
 
 	std::unique_ptr<ThinArchive> tar =
@@ -294,7 +295,8 @@ GenCommand::GenerateWrapper(const std::vector<std::pair<StringRef, StringRef>> &
 		out_file << "\t{\n"
 			 << "\t\t.old_name = \"" << func_name.str() << "\",\n"
 			 << "\t\t.new_func = "
-			 << std::string(kLivepatchPrefixTmpl) << func_name.str()<< ",\n"
+			 << std::string(kLivepatchPrefixTmpl) << func_name.str()
+			 << ",\n"
 			 << "\t\t.old_sympos = " << std::to_string(pos) << ",\n"
 			 << "\t},\n";
 	}
@@ -314,8 +316,8 @@ GenCommand::GenerateWrapper(const std::vector<std::pair<StringRef, StringRef>> &
 	return ErrorCode::NO_ERROR;
 }
 
-std::error_code
-GenCommand::GenerateLdScript(const std::vector<std::pair<StringRef, StringRef>> &klp_func_names)
+std::error_code GenCommand::GenerateLdScript(
+	const std::vector<std::pair<StringRef, StringRef> > &klp_func_names)
 {
 	static constexpr std::string_view kLdScriptName = "livepatch.lds";
 
@@ -337,8 +339,10 @@ GenCommand::GenerateLdScript(const std::vector<std::pair<StringRef, StringRef>> 
 
 	for (auto [func_name, src_file] : klp_func_names) {
 		// ${func} = __${func}
-		out_file << std::string(kLivepatchPrefixTmpl) << func_name.str() + " = "
-			 << std::string(kLivepatchPrefixElf) << func_name.str() + ";\n";
+		out_file << std::string(kLivepatchPrefixTmpl)
+			 << func_name.str() + " = "
+			 << std::string(kLivepatchPrefixElf)
+			 << func_name.str() + ";\n";
 	}
 
 	return ErrorCode::NO_ERROR;

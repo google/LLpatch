@@ -27,8 +27,9 @@
 
 #include "llvm/ADT/StringRef.h"
 
-namespace llvm {
-	class Function;
+namespace llvm
+{
+class Function;
 }
 
 // This class creates an iterator to browse through all symbols in elf
@@ -116,11 +117,13 @@ class ElfSymbol final {
 	bool IsKLPLocalSymbol() const noexcept(false);
 
 	static std::string CreateKlpLocalSymName(llvm::StringRef sym_name);
-	static std::string CreateLivepatchedFunctionName(const llvm::Function &fn,
-							 llvm::StringRef base_path);
-	static std::string CreateLivepatchedSymbolName(
-		llvm::StringRef orig_name, llvm::StringRef filename,
-		llvm::StringRef base_path);
+	static std::string
+	CreateLivepatchedFunctionName(const llvm::Function &fn,
+				      llvm::StringRef base_path);
+	static std::string
+	CreateLivepatchedSymbolName(llvm::StringRef orig_name,
+				    llvm::StringRef filename,
+				    llvm::StringRef base_path);
 
     private:
 	void GetGElfSymbol(GElf_Sym *sym) const noexcept(false);

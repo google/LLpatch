@@ -225,7 +225,8 @@ std::error_code DistillDiffFunctions(DiffConsumer *consumer, Module *original,
 			// needs to be livepatched. The postfix specifies the
 			// source file for this change.
 			RFn.setName(std::string(kLivepatchPrefix) +
-				    ElfSymbol::CreateLivepatchedFunctionName(RFn, base_path));
+				    ElfSymbol::CreateLivepatchedFunctionName(
+					    RFn, base_path));
 
 			// clang could remove livepatched function during its
 			// optimization step. To prevent that, the livepatched function
@@ -351,7 +352,8 @@ void RemoveSpecialGlobals(Module *mod)
 	mod->setModuleInlineAsm(inline_assembly);
 }
 
-std::error_code DistillDiffGlobals(Module *original, Module *patched, StringRef base_path)
+std::error_code DistillDiffGlobals(Module *original, Module *patched,
+				   StringRef base_path)
 {
 	RemoveSpecialGlobals(patched);
 
@@ -389,10 +391,9 @@ std::error_code DistillDiffGlobals(Module *original, Module *patched, StringRef 
 		}
 
 		// Both the 'original' and 'patched' have the same global variable.
-		if (GVL->getType()->getTypeID() !=
-		    GVR.getType()->getTypeID()) {
-			errs() << "WARN: type of global variable, "
-			       << gvar_name << ", is changed\n"
+		if (GVL->getType()->getTypeID() != GVR.getType()->getTypeID()) {
+			errs() << "WARN: type of global variable, " << gvar_name
+			       << ", is changed\n"
 			       << "  type in original: "
 			       << GVL->getType()->getTypeID() << "\n"
 			       << "  type in patched: "
@@ -415,11 +416,10 @@ std::error_code DistillDiffGlobals(Module *original, Module *patched, StringRef 
 		GVR.setInitializer(nullptr);
 		GVR.setLinkage(GlobalValue::ExternalLinkage);
 
-		if (GVR.isDSOLocal() && GVR.getName() !="__fentry__") {
-			GVR.setName(
-				ElfSymbol::CreateLivepatchedSymbolName(
-					GVR.getName(), original->getSourceFileName(),
-					base_path));
+		if (GVR.isDSOLocal() && GVR.getName() != "__fentry__") {
+			GVR.setName(ElfSymbol::CreateLivepatchedSymbolName(
+				GVR.getName(), original->getSourceFileName(),
+				base_path));
 		}
 	}
 
@@ -488,9 +488,8 @@ DiffCommand::DistillDiff(std::unique_ptr<Module> original,
 			 std::unique_ptr<Module> patched)
 {
 	DiffConsumer consumer(quiet_mode_ ? nulls() : outs());
-	std::error_code ec =
-		DistillDiffFunctions(&consumer, original.get(), patched.get(),
-				     base_dir_);
+	std::error_code ec = DistillDiffFunctions(&consumer, original.get(),
+						  patched.get(), base_dir_);
 	if (ec) {
 		return nullptr;
 	}

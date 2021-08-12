@@ -54,12 +54,14 @@ class GenCommand : public Command {
 
     private:
 	// Takes a vector of livepatched function names and generates a wrapper.
-	std::error_code
-	GenerateWrapper(const std::vector<std::pair<llvm::StringRef, llvm::StringRef>> &klp_func_names,
-			const std::string &mod_name);
+	std::error_code GenerateWrapper(
+		const std::vector<std::pair<llvm::StringRef, llvm::StringRef> >
+			&klp_func_names,
+		const std::string &mod_name);
 	// Takes a vector of livepatched function names and generates an ld script.
-	std::error_code
-	GenerateLdScript(const std::vector<std::pair<llvm::StringRef, llvm::StringRef>> &klp_func_names);
+	std::error_code GenerateLdScript(
+		const std::vector<std::pair<llvm::StringRef, llvm::StringRef> >
+			&klp_func_names);
 	std::error_code GenerateMakefile();
 	std::error_code FixupKlpSymbols(ElfBin *elf_bin);
 
