@@ -39,24 +39,36 @@ struct CommandErrorCategory : std::error_category {
 
 std::string CommandErrorCategory::message(int ev) const
 {
+	const char *msg = nullptr;
+
 	switch (static_cast<Command::ErrorCode>(ev)) {
 	case Command::ErrorCode::INVALID_COMMAND:
-		return "invalid command";
+		msg = "invalid command";
+		break;
 	case Command::ErrorCode::NOT_ENOUGH_ARGS:
-		return "not enough arguments";
+		msg = "not enough arguments";
+		break;
 	case Command::ErrorCode::INVALID_LLVM_FILE:
-		return "invalid LLVM file";
+		msg = "invalid LLVM file";
+		break;
 	case Command::ErrorCode::DIFF_FAILED:
-		return "diff failed";
+		msg = "diff failed";
+		break;
 	case Command::ErrorCode::FILE_OPEN_FAILED:
-		return "failed to open file";
+		msg = "failed to open file";
+		break;
 	case Command::ErrorCode::INVALID_PATCH_FILE:
-		return "invalid patch file";
+		msg = "invalid patch file";
+		break;
 	case Command::ErrorCode::NOTHING_TO_PATCH:
-		return "nothing to patch";
+		msg = "nothing to patch";
+		break;
 	default:
-		return "unrecognized error";
+		msg = "unrecognized error";
+		break;
 	}
+
+	return std::string(name()) + ": " + msg;
 }
 
 const CommandErrorCategory _CommandErrorCategory{};
@@ -64,8 +76,13 @@ const CommandErrorCategory _CommandErrorCategory{};
 
 std::unique_ptr<Command> Command::Create(int argc, char **argv) noexcept(false)
 {
+	const char *exec_name = argv[0];
+	if (const char *slash = rindex(exec_name, '/')) {
+		exec_name = slash + 1;
+	}
+
 	if (argc < 2) {
-		return std::make_unique<UsageCommand>(argv[0]);
+		return std::make_unique<UsageCommand>(exec_name);
 	}
 
 	std::string command = argv[1];
@@ -77,9 +94,11 @@ std::unique_ptr<Command> Command::Create(int argc, char **argv) noexcept(false)
 		return FixupCommand::Create(argc, argv);
 	} else if (command == AlignCommand::kCommandName) {
 		return std::make_unique<AlignCommand>(argc, argv);
-	} else {
-		throw std::error_code{ ErrorCode::INVALID_COMMAND };
+	} else if (command == UsageCommand::kCommandName) {
+		return std::make_unique<UsageCommand>(exec_name);
 	}
+
+	throw std::error_code{ ErrorCode::INVALID_COMMAND };
 }
 
 std::error_code UsageCommand::Run()

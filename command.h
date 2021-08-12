@@ -53,6 +53,8 @@ struct Command {
 // This class implement a simple command to print out command usage.
 class UsageCommand : public Command {
     public:
+	static constexpr std::string_view kCommandName = "help";
+
 	UsageCommand(const char *cmd) noexcept : cmd_(cmd)
 	{
 	}
