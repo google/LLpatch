@@ -1,0 +1,181 @@
+# Copyright 2021 Google LLC
+# 
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+# 
+#     https://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#---------------------------------------------
+# Makefile.macros: common macros
+#
+# Author: yonghyun@google.com (Yonghyun Hwang)
+# -------------------------------------------------------------------------
+
+# Project information
+
+PACKAGE		:= project
+VERSION_MAJOR	:= 0
+VERSION_MINOR	:= 0
+VERSION_PATCH	:= 0
+VERSION		:= $(VERSION_MAJOR).$(VERSION_MINOR).$(VERSION_PATCH)
+RELEASE		:=
+PROJECT_VERSION	:= $(PACKAGE)-$(VERSION)-$(RELEASE)
+PROJECT		:= $(PROJECT_VERSION:-=)
+
+# --------------------------------------------
+# Magic part: please don't touch if you don't know what you are doing
+# --------------------------------------------
+
+# Installation directories: variable names adhere to GNU Makefile conventions
+
+prefix 		:= $(PACKAGE)
+exec_prefix	:= $(prefix)
+bindir		:= $(exec_prefix)/bin
+libdir		:= $(exec_prefix)/lib
+sysconfdir	:= $(prefix)/etc
+includedir	:= $(prefix)/inc
+mandir		:= $(prefix)/man
+docdir		:= $(prefix)/docs
+
+# System-dependent global compile & link options
+
+SYS_DEFS	:= 
+SYS_HEADER_INCS	:=
+SYS_LIB_INCS	:= 
+SYS_LIBS	:=
+
+# Default macros for compiling and linking
+
+ifeq ($(CC),)
+  CC 			:= gcc  # C compiler
+endif
+ifeq ($(CXX),)
+  CXX			:= g++  # C++ compiler
+endif
+CPP         := ${CC} -E   # C preprocessor
+CXXCPP      := ${CXX} -E   # C++ preprocessor
+LD				:= ld		# C Linker
+LDXX			:= ld		# C++ Linker
+CPPFLAGS 	:= -MMD	# Preprocessor flags
+CFLAGS 		:= -Wall -pipe	 # C compiler flags
+CXXFLAGS 	:= -Wall -pipe   # C++ compiler flags
+LDFLAGS		:=    	# C Linker flags
+LDXXFLAGS	:= 		# C++ Linker flags
+
+ifeq ($(EXE),)
+  EXE 		:= $(PACKAGE)
+endif
+
+# File permissions
+# Below are future use. When porting the project into Unix machine, they can be used
+
+FILE_GROUP	:= project # 'project' is temporary name for grp
+FILE_DPERM	:= 0640 # permission for data
+FILE_EPERM	:= 0750 # permission for executable bins or libs
+FILE_PERM	:= u+rwX,g-w+rX,o-rwx
+INSTALL_GROUP	:= project # 'project' is temporary
+INSTALL_DPERM	:= 0640
+INSTALL_EPERM	:= 0750
+INSTALL_PERM	:= u+rwX,g-sw+rX,o-rwx
+
+
+# Installation commands
+
+UMASK		:= umask
+CHMOD		:= chmod
+CHMOD_PROGRAM	:= $(CHMOD) $(INSTALL_EPERM)
+CHMOD_DATA		:= $(CHMOD) $(INSTALL_DPERM)
+CHGRP		:= chgrp
+CHGRP_PROGRAM	:= $(CHGRP) $(INSTALL_GROUP)
+CHGRP_DATA	:= $(CHGRP) $(INSTALL_GROUP)
+INSTALL		:= /usr/bin/install
+INSTALL_DIR 		:= $(INSTALL) -d -g $(INSTALL_GROUP) -m $(INSTALL_EPERM)
+INSTALL_PROGRAM 	:= $(INSTALL) -c -g $(INSTALL_GROUP) -m $(INSTALL_EPERM)
+INSTALL_DATA		:= $(INSTALL) -c -g $(INSTALL_GROUP) -m $(INSTALL_DPERM)
+STRIP		:= strip
+
+# Other standard tools
+# The tools below are supported by cygwin
+# !!! Do not use 'ar' and 'ranlib'. They are solely for unix machine
+# Current project is based on Windows Vista
+
+MAKE 		:= make
+TAR 		:= tar
+GREP		:= grep
+FIND		:= find
+PERL		:= perl
+GZIP		:= gzip -f
+CP			:= cp -f
+MV			:= mv -f
+RM 		:= rm -f
+LN			:= ln -s
+TOUCH		:= touch
+MKDIR    := mkdir -p
+AR			:= ar
+RANLIB	:= ranlib
+ECHO     := echo
+SED		:= sed
+PWD      := $(shell /bin/pwd)
+
+# -----------------------
+# default macros for build
+
+# default values for macros (from command line)
+PLATFORM = linux64
+CONFIG = debug
+
+BUILD_PLATFORM := linux64
+BUILD_CONFIG := debug
+
+# 3: list of lib dirs
+LIB_DIRS        = 
+PRJ_LOCAL_LIB_INC   = $(patsubst %,-L$(PRJ_ROOT_DIR)/%,$(LIB_DIRS))
+PRJ_LOCAL_INC   = $(patsubst %,-I$(PRJ_ROOT_DIR)/%,$(LIB_DIRS))
+
+# optimzation options
+ifeq ($(CONFIG),debug)
+CFLAGS += -O0
+CXXFLAGS += -O0
+BUILD_CONFIG := debug
+else
+
+ifeq ($(CONFIG),optimize)
+CFLAGS += -O3 -DNDEBUG
+CXXFLAGS += -O3 -DNDEBUG
+BUILD_CONFIG := optimize
+else
+$(error "CONFIG can be either debug or optimize")
+
+endif
+endif
+
+# platform
+ifeq ($(PLATFORM),linux)
+BUILD_PLATFORM := linux
+CC += -m32
+CXX += -m32
+else
+BUILD_PLATFORM := linux64
+endif
+
+BUILD_DIR_ROOT := .build
+BUILD_DIR := $(BUILD_DIR_ROOT)/$(BUILD_PLATFORM)-$(BUILD_CONFIG)
+
+ifeq ($(SRCS),)
+SRCS     := $(patsubst %.cc,%,$(wildcard *.cc))
+SRCS     += $(patsubst %.cpp,%,$(wildcard *.cpp))
+SRCS     += $(patsubst %.c,%,$(wildcard *.c))
+else
+SRCS     := $(patsubst %.cc,%,$(SRCS))
+SRCS     += $(patsubst %.cpp,%,$(SRCS))
+SRCS     += $(patsubst %.c,%,$(SRCS))
+endif
+
+OBJS 		= $(SRCS:%=$(BUILD_DIR)/%.o)
+DEPS		= $(SRCS:%=$(BUILD_DIR)/%.d)

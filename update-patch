@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+#
+# Copyright 2021 Google LLC
+# 
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+# 
+#     https://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Author: yonghyun@google.com (Yonghyun Hwang)
+#
+# This script takes patch file and updates it to avoid fuzz matching for
+# patching. For the update, this applies the given patch to kernel
+# repository and creates a new patch.  The updated patch file is required
+# for kernel livepatch generation where fuzz matching for the patching is
+# not allowed.
+
+#-------------------------------------------------------------
+# Shell setting
+#-------------------------------------------------------------
+set -E
+
+#-------------------------------------------------------------
+# Global variables
+#-------------------------------------------------------------
+declare -r G_KDIR="$(pwd)"
+declare -r G_UPDATE_PATCH_CMD="$0"
+declare -r G_UPDATE_PATCH_PATH=$(dirname $(readlink -f "${G_UPDATE_PATCH_CMD}"))
+declare -r G_OUT_FILE="${2:-}"
+declare -r G_TMP_FILE="$(mktemp -t update_patch_tmp.XXXXXXXXXX)"
+declare -r G_TMP_MSG_FILE="$(mktemp -t commit_message.XXXXXXXXXX)"
+
+declare G_IN_FILE="${1:-}"
+declare -i G_PATCHED_DIRTY=0
+declare G_COMMIT_HASH=""
+
+#-------------------------------------------------------------
+# Include library
+#-------------------------------------------------------------
+source "${G_UPDATE_PATCH_PATH}/libutil.bash" "update-patch"
+
+#-------------------------------------------------------------
+# Function definitions
+#-------------------------------------------------------------
+function cleanup()
+{
+	local errCode="${1:-}"
+	local lineNum="${2:-}"
+
+	[[ ${errCode} == 0 ]] || \
+		util::log_error "trap at line: ${lineNum}, with error:${errCode}."
+
+	if [[ ${G_PATCHED_DIRTY} == 1 ]]; then
+		patch -R -p1 -s -d "${G_KDIR}" -i "${G_IN_FILE}"
+		G_PATCHED_DIRTY=0
+		util::log_ok "Patch is reverted"
+	fi
+
+	[[ -z "${G_COMMIT_HASH}" ]] ||
+		git reset -q --hard "${G_COMMIT_HASH}"
+
+	rm -f "${G_TMP_MSG_FILE}" "${G_TMP_FILE}"
+
+	exit "${errCode}"
+}
+# enable exit trap for debugging purpose
+trap 'cleanup $? ${LINENO}' ERR INT TERM EXIT
+
+function print_usage()
+{
+	cat <<EOF
+Usage: ${G_UPDATE_PATCH_CMD} [IN_FILE] [OUT_FILE]
+Update .patch file, [IN_FILE] to [OUT_FILE]
+
+File: patch file
+EOF
+	return 0
+}
+
+# validate options and prepare livepatch build
+function validate_prepare()
+{
+	[[ -f MAINTAINERS && -d init ]] || \
+		util::error "Should be run under root of kernel repository"
+
+	# confirm input patch file has valid format
+	[[ -f "${G_IN_FILE}" ]] || \
+		util::error "Given patch file doesn't exist."
+	declare -r G_IN_FILE="$(readlink -f "${G_IN_FILE}")"
+	[[ $(file -b --mime-type "${G_IN_FILE}") =~ text.*diff$ ]] || \
+		util::error "Invalid patch file format."
+
+	# dry run for patch
+	patch -N -p1 -d "${G_KDIR}" --dry-run -i "${G_IN_FILE}" >& /dev/null || \
+		util::error "Failed to apply patch"
+
+	# don't allow overwrite
+	[[ ! -f "${G_OUT_FILE}" ]] || \
+		util::error "Output file already exists."
+
+	# make sure that git repository is clean
+	if [[ $(git status -s | wc -l) != 0 ]]; then
+		git status
+		util::error "Please clean up git repository"
+	fi
+
+	G_COMMIT_HASH="$(git log -1 --format="%H")"
+}
+
+#-------------------------------------------------------------
+# Main starts here
+#-------------------------------------------------------------
+if [[ $# < 2 ]]; then
+	print_usage
+	exit 0
+fi
+
+validate_prepare
+
+util::log_info "Applying a patch, $(basename "${G_IN_FILE}")"
+patch -N -p1 -d "${G_KDIR}" -i "${G_IN_FILE}"
+G_PATCHED_DIRTY=1
+util::log_ok "Patch is applied"
+
+declare author=""
+declare email=""
+declare subject=""
+while read line; do
+	case "${line}" in
+		"Author: "*)
+			author="${line#Author: }"
+			util::log_info "Author: ${author}"
+			;;
+		"Email: "*)
+			email="${line#Email: }"
+			util::log_info "Email: ${email}"
+			;;
+		"Subject: "*)
+			subject="${line#Subject: }"
+			util::log_info "Subject: ${subject}"
+			;;
+		*)
+			break;
+	esac
+done < <(cat "${G_IN_FILE}" | git mailinfo "${G_TMP_FILE}" /dev/null)
+
+if [[ -z "${author}" || -z "${email}" || -z "${subject}" ]]; then
+	util::log_info "author|email|subject is not available for git patch"
+	git diff >| "${G_OUT_FILE}"
+	util::log_ok "Generated a simple diff, ${G_OUT_FILE}"
+	exit 0
+fi
+
+util::log_info "Commit message"
+{
+	echo "${subject}"
+	echo ""
+	cat "${G_TMP_FILE}"
+} >| "${G_TMP_MSG_FILE}"
+
+cat "${G_TMP_MSG_FILE}"
+echo ---------------
+
+util::log_info "Create a temporary commit"
+{
+	git add .
+	git commit -F "${G_TMP_MSG_FILE}" --author="${author} <${email}>"
+} >& /dev/null
+
+G_PATCHED_DIRTY=0
+
+util::log_info "Generate a patch and remove the temporary commit"
+git format-patch -n1 --output="${G_OUT_FILE}" HEAD >& /dev/null
+
+util::log_ok "Generated a new patch, ${G_OUT_FILE}"

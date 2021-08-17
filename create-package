@@ -1,0 +1,389 @@
+#!/usr/bin/env bash
+#
+# Copyright 2021 Google LLC
+# 
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+# 
+#     https://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Author: yonghyun@google.com (Yonghyun Hwang)
+#
+# script to generate a tarball, package, for kernel livepatch
+
+#-------------------------------------------------------------
+# Shell setting
+#-------------------------------------------------------------
+set -E
+
+#-------------------------------------------------------------
+# Global variables
+#-------------------------------------------------------------
+declare -r G_CREATE_PACKAGE_CMD="$0"
+declare -r G_CREATE_PACKAGE_CMDLINE="$0 $@"
+declare -r G_CREATE_PACKAGE_PATH=$(dirname $(readlink -f "${G_CREATE_PACKAGE_CMD}"))
+declare -r G_TMP_DIR="$(mktemp -d -t livepatch.XXXXXXXXXX)"
+declare -r G_PKG_ROOT="${G_TMP_DIR}/pkg"
+
+declare G_DBG_DIR=""
+declare G_KDIR=""
+
+declare G_BUILDINFO_FILE=""
+declare G_KLP_FILE=""
+declare G_PATCH_FILE=""
+declare G_PKG_FILE=""
+
+#-------------------------------------------------------------
+# Include library
+#-------------------------------------------------------------
+source "${G_CREATE_PACKAGE_PATH}/libutil.bash" "create-package"
+
+#-------------------------------------------------------------
+# Function definitions
+#-------------------------------------------------------------
+function cleanup()
+{
+	local errCode="${1:-}"
+	local lineNum="${2:-}"
+
+	[[ ${errCode} == 0 ]] || \
+		util::log_error "trap at line: ${lineNum}, with error:${errCode}."
+
+	if [[ -n "${G_DEBUG_DIR}" ]]; then
+		mv -f "${G_PKG_ROOT}" "${G_DEBUG_DIR}"
+		G_DEBUG_DIR=""
+	fi
+	rm -fr "${G_TMP_DIR}"
+
+	exit "${errCode}"
+}
+# enable exit trap for debugging purpose
+trap 'cleanup $? ${LINENO}' ERR INT TERM EXIT
+
+function print_usage()
+{
+	cat <<EOF
+Usage: ${G_CREATE_PACKAGE_CMD} [OPTIONS] [FILE]
+Build a tarball, package for kernel livepatch.
+
+File: .ko file, kernel module, for kernel livepatch
+
+Options:
+  -b, --buildinfo   Path to a buildinfo file
+  -h, --help   This help message.
+  -o, --output  Path to a tarball for kernel livepatch package
+  -p, --patch   Path to a patch file
+
+Developer Options:	(for internal testing, not production use)
+  --debug-dir		Dir for debugging with all intermediate files for klp generation
+EOF
+	return 0
+}
+
+function parse_options()
+{
+	local args
+
+	if [[ $# == 0 ]]; then
+		print_usage
+		exit 0
+	fi
+
+	args=$(getopt -q -n "${G_CREATE_PACKAGE_CMD}" -o b:,h,o:,p: \
+		-l buildinfo:,debug-dir:,help,output:,patch: \
+		-- "$@")
+
+	if [[ $? == 1 ]]; then
+		print_usage
+		exit 0
+	fi
+	eval set -- "${args}"
+
+	while true; do
+		local arg="${1}"
+		shift
+		case "${arg}" in
+			-b|--buildinfo)
+				G_BUILDINFO_FILE="${1}"
+				shift
+				;;
+			--debug-dir)
+				G_DEBUG_DIR="${1}"
+				shift
+				;;
+			-h|--help)
+				print_usage
+				exit 0
+				;;
+			-o|--output)
+				G_PKG_FILE="${1}"
+				shift
+				;;
+			-p|--patch)
+				G_PATCH_FILE="${1}"
+				shift
+				;;
+			*)
+				break;
+		esac
+	done
+
+	# The rest is a file for kernel livepatch
+	G_KLP_FILE="${1}"
+
+	return 0
+}
+
+# validate options and prepare package build
+function validate_prepare()
+{
+	[[ -f "${G_KLP_FILE}" ]] || \
+		util::error "Given kernel module, ${G_KLP_FILE}, doesn't exist."
+	G_KLP_FILE="$(readlink -f "${G_KLP_FILE}")"
+	modinfo "${G_KLP_FILE}" | grep -q 'livepatch.*Y' || \
+		util::error "Invalid kernel module for livepatch."
+	if readelf -s "${G_KLP_FILE}" | grep -q '\.klp\.sym'; then
+		readelf -S "${G_KLP_FILE}" | grep -q '\.klp\.rela.* RELA' || \
+			util::error "No rela for KLP. please run 'livepatch fixup --rela' command"
+	fi
+
+	if [[ -n "${G_DEBUG_DIR}" ]]; then
+		mkdir -p "${G_DEBUG_DIR}"
+		G_DEBUG_DIR="$(readlink -f ${G_DEBUG_DIR})"
+	fi
+
+	[[ -f "${G_PATCH_FILE}" ]] || \
+		util::error "patch file is not given"
+	G_PATCH_FILE="$(readlink -f "${G_PATCH_FILE}")"
+	[[ $(file -b --mime-type "${G_PATCH_FILE}") =~ text.*diff$ ]] || \
+		util::error "Invalid patch file format."
+
+	[[ -f "${G_BUILDINFO_FILE}" ]] || \
+		util::error "buildinfo file is not given"
+	G_BUILDINFO_FILE="$(readlink -f "${G_BUILDINFO_FILE}")"
+
+	[[ -n "${G_PKG_FILE}" ]] || \
+		util::error "pkg filename is not given"
+
+	G_KDIR=$(pwd)
+	[[ -f MAINTAINERS && -d init ]] || \
+		util::error "Invalid git repository for kernel: ${G_KDIR}"
+
+	return 0
+}
+
+function get_ko_name() {
+	echo $(basename "${G_KLP_FILE}")
+}
+
+function get_mod_name() {
+	modinfo -F name "${G_KLP_FILE}"
+}
+
+function generate_script_header()
+{
+	local -r FILENAME="${1}"
+	cat >| "${FILENAME}" <<EOF
+#!/usr/bin/env bash
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+# Copyright 2021 Google Inc. All Rights Reserved.
+# Author: yonghyun@google.com (Yonghyun Hwang)
+#
+# This is auto-generated for kernel patch, $(get_ko_name).
+
+EOF
+
+	# import libutil.bash here
+	sed -n '/^#----------------/,$p' "${G_CREATE_PACKAGE_PATH}/libutil.bash" >> "${FILENAME}"
+
+	cat >> "${FILENAME}" <<EOF
+
+function exit_on_error()
+{
+	local errCode="\${1:-}"
+	local lineNum="\${2:-}"
+	util::log_error "trap at line: \${lineNum}, with error:\${errCode}."
+	exit "\${errCode}"
+}
+# enable exit trap for debugging purpose
+trap 'exit_on_error \$? \${LINENO}' ERR INT TERM
+
+# Main starts here
+EOF
+}
+
+function generate_script_apply()
+{
+	local -r SCRIPT_NAME="${1}"
+	generate_script_header "${SCRIPT_NAME}"
+	cat >> "${SCRIPT_NAME}" <<EOF
+declare -r PATCH_ROOT="\$(dirname "\$(readlink -f "\${BASH_SOURCE[0]}")")"
+declare -r LIVEPATCH_KO="\${PATCH_ROOT}/$(get_ko_name)"
+
+[[ -e "\${LIVEPATCH_KO}" ]] || \\
+   util::log_error "Failed to locate livepatch, \${LIVEPATCH_KO}"
+
+insmod "\${LIVEPATCH_KO}" || \\
+   util::log_error "Failed to load livepatch, \${LIVEPATCH_KO}"
+
+# Need to wait for complete transition here.
+declare -r SYSFS_LIVEPATCH="/sys/kernel/livepatch"
+declare -r MODULE_NAME="$(get_mod_name)"
+declare -r LIVEPATCH_ENABLED="\${SYSFS_LIVEPATCH}/\${MODULE_NAME}/enabled"
+
+util::log_info "Livepatch, \${MODULE_NAME}, is loaded"
+util::log_info "Waiting for Livepatch, \${MODULE_NAME}, applied"
+
+for i in {1..3}; do
+	if [[ -e "\${LIVEPATCH_ENABLED}" && \\
+	   \$(cat "\${LIVEPATCH_ENABLED}") == 1 ]]; then
+	   util::log_ok "Livepatch, \${MODULE_NAME}, is applied"
+	   exit 0
+	fi
+	sleep 2s
+done
+
+util::log_error "Livepatch, \${MODULE_NAME}, is not enabled yet"
+EOF
+	chmod a+x "${SCRIPT_NAME}"
+}
+
+function generate_script_revert()
+{
+	local -r SCRIPT_NAME="${1}"
+	generate_script_header "${SCRIPT_NAME}"
+	cat >> "${SCRIPT_NAME}" <<EOF
+declare -r SYSFS_LIVEPATCH="/sys/kernel/livepatch"
+declare -r MODULE_NAME="$(get_mod_name)"
+declare -r LIVEPATCH_ENABLED="\${SYSFS_LIVEPATCH}/\${MODULE_NAME}/enabled"
+
+[[ -e "\${LIVEPATCH_ENABLED}" ]] || \\
+	util::log_error "livepatch, \${MODULE_NAME}, is not loaded."
+
+[[ \$(cat "\${LIVEPATCH_ENABLED}") == 1 ]] || \\
+	util::log_error "Livepatch, \${MODULE_NAME}, is not enabled"
+
+util::log_info "Reverting Livepatch, \${MODULE_NAME}."
+declare -i i=0
+while true; do
+	declare out="\$(export LC_ALL=C; sh -c "echo 0 > \${LIVEPATCH_ENABLED}" 2>&1)"
+	[[ -z "\${out}" ]] && break
+
+	i=\$((i+1))
+	if [[ \${i} -eq 3 ]]; then
+		util::log_error "Failed to disable the livepatch, \${MODULE_NAME}."
+		exit 1
+	else
+		util::log_info "Retrying..."
+		sleep 2s
+	fi
+done
+util::log_info "Livepatch, \${MODULE_NAME}, is disabled"
+
+util::log_info "Unloading Livepatch, \${MODULE_NAME}"
+i=0
+while sleep 2s; do
+	rmmod "\${MODULE_NAME}" && break
+	i=\$((i+1))
+	if [[ \${i} -eq 3 ]]; then
+		util::log_error "Failed to unload the livepatch, \${MODULE_NAME}."
+		exit 1
+	else
+		util::log_info "Retrying unloading..."
+	fi
+done
+
+util::log_ok "Livepatch, \${MODULE_NAME}, is unloaded"
+exit 0
+EOF
+	chmod a+x "${SCRIPT_NAME}"
+}
+
+function generate_script_check()
+{
+	local -r SCRIPT_NAME="${1}"
+	generate_script_header "${SCRIPT_NAME}"
+	cat >> "${SCRIPT_NAME}" <<EOF
+declare -r SYSFS_LIVEPATCH="/sys/kernel/livepatch"
+declare -r MODULE_NAME="$(get_mod_name)"
+declare -r LIVEPATCH_ENABLED="\${SYSFS_LIVEPATCH}/\${MODULE_NAME}/enabled"
+
+[[ -e "\${LIVEPATCH_ENABLED}" ]] || \\
+	util::log_error "livepatch, \${MODULE_NAME}, is not loaded."
+
+[[ \$(cat "\${LIVEPATCH_ENABLED}") == 1 ]] || \\
+	util::log_error "Livepatch, \${MODULE_NAME}, is not enabled"
+
+util::log_ok "Livepatch, \${MODULE_NAME}, is enabled"
+exit 0
+EOF
+	chmod a+x "${SCRIPT_NAME}"
+}
+
+# Build a package for livepatch, a tarball w/ the following contents.
+#
+# ./etc/rcS.d/S165kernelpatch-${KERNEL_RELEASE}-${name} -> ../../lib/patches/${KERNEL_RELEASE}/${name}/apply
+#./lib/patches/${KERNEL_RELEASE}/${name}/apply
+#./lib/patches/${KERNEL_RELEASE}/${name}/check
+#./lib/patches/${KERNEL_RELEASE}/${name}/revert
+#./lib/patches/${KERNEL_RELEASE}/${name}/patch
+#./lib/patches/${KERNEL_RELEASE}/${name}/buildinfo
+#./lib/patches/${KERNEL_RELEASE}/${name}/livepatch-${name}.ko
+#
+# This function assumes that `cwd` is ${kdir}.
+function package_build()
+{
+	util::log_info "Building livepatch package."
+	local -r KERNEL_RELEASE="$(strings "init/version.o" | awk '/^Linux version/ { print $3 }')"
+	local -r PATCH_NAME="${1}"
+
+	local -r SCRIPT_PATH="lib/patches/${KERNEL_RELEASE}/$(util::get_livepatch_name "${PATCH_NAME}")"
+	local -r SCRIPT_FULL_PATH="${G_PKG_ROOT}/${SCRIPT_PATH}"
+	if ! mkdir -p "${SCRIPT_FULL_PATH}"; then
+		util::error "Failed to create a path for livepatch script."
+	fi
+
+	cp -f "${G_KLP_FILE}" "${SCRIPT_FULL_PATH}"
+	cp -f "${G_PATCH_FILE}" "${SCRIPT_FULL_PATH}/patch"
+	cp -f "${G_BUILDINFO_FILE}" "${SCRIPT_FULL_PATH}/buildinfo"
+	generate_script_apply "${SCRIPT_FULL_PATH}/apply"
+	generate_script_revert "${SCRIPT_FULL_PATH}/revert"
+	generate_script_check "${SCRIPT_FULL_PATH}/check"
+
+	# Create symlink to apply livepatch from /etc/rcS.d
+	local -r INIT_PATH="etc/rcS.d"
+	local -r INIT_FULL_PATH="${G_PKG_ROOT}/${INIT_PATH}"
+	if ! mkdir -p "${INIT_FULL_PATH}"; then
+		util::error "Failed to create a path for init.d script."
+	fi
+	ln -r -s "${SCRIPT_FULL_PATH}/apply" \
+		"${INIT_FULL_PATH}/S165kernelpatch-${KERNEL_RELEASE}-$(util::get_livepatch_name "${PATCH_NAME}")"
+
+	# Set correct mode bits
+	chmod -R u=rwX,go=rX "${G_PKG_ROOT}"
+
+	# Create a package tarball.
+	tar -C "${G_PKG_ROOT}" --owner=root --group=root -cJ -f "${G_PKG_FILE}" \
+		"${SCRIPT_PATH}" "${INIT_PATH}" || util::error "tar Failed"
+	util::log_ok "Created ${G_PKG_FILE}"
+}
+
+#-------------------------------------------------------------
+# Main starts here
+#-------------------------------------------------------------
+parse_options "$@"
+
+validate_prepare
+
+package_build "${G_PATCH_FILE}"
+
+exit 0

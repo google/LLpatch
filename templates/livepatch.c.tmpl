@@ -1,0 +1,87 @@
+/*
+ * Copyright 2021 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ *     Author: Yonghyun Hwang <yonghyun@google.com>
+ *
+ * livepatch.c: template for kernel live patch module. this file is used to
+ * generate kernel livepatch. `livepatch gen` command will parse in this file
+ * and replaces {{MARKERS}} to fill out "struct klp_func" and "struct
+ * klp_object".
+ *
+ */
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/livepatch.h>
+
+/*
+ * List of livepatched functions. Note that function prototypes for all
+ * livepatched functions are void livepatch_${name_of_func}(void) to avoid
+ * header file inclusion for correct function prototypes. The address of
+ * these functions will be resolved by the ld script, livepatch.lds.
+ */
+{{LIST_OF_LIVEPATCH_FUNCTIONS}}
+
+/*
+ * List of livepatched functions.
+ * If format of this struct (e.g., indentation or adding new element) is changed,
+ * awk processing in `llpatch-merge` should be updated and synced.
+ */
+static struct klp_func funcs[] = {
+	/* list of
+	 *{
+	 *   .old_name = "${name_of_func}",
+	 *   .new_name = "livepatch_${name_of_func}",
+	 *   .old_sympos = ${sympos},
+	 *},
+	 */
+{{LIST_FOR_KLP_FUNC_STRUCT}}
+	{}
+};
+
+/*
+ * TODO: List of livepatched objects. For now, only one entry
+ * is allowed. This implies that current livepatch generation allows
+ * changes in either a "single" kernel module or vmlinux. Not both or in
+ * multple kernel modules.  This restriction should be relaxed to allow
+ * changes in multiple kernel modules and/or vmlinux.
+ */
+static struct klp_object objs[] = {
+	{
+		/*
+		 * NULL name NULL means vmlinux. unless, it's module name
+		 * .name = NULL,
+		 */
+{{NAME_OF_OBJECT}}
+		.funcs = funcs,
+	},
+	{}
+};
+
+static struct klp_patch patch = {
+	.mod = THIS_MODULE,
+	.objs = objs,
+};
+
+static int livepatch_init(void)
+{
+	return klp_enable_patch(&patch);
+}
+
+static void livepatch_exit(void) {}
+
+module_init(livepatch_init);
+module_exit(livepatch_exit);
+MODULE_LICENSE("GPL");
+MODULE_INFO(livepatch, "Y");

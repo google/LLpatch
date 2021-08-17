@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+#
+# Copyright 2021 Google LLC
+# 
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+# 
+#     https://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Author: yonghyun@google.com (Yonghyun Hwang)
+#
+# This script compiles LLVM IR file (or c file) to object file (or LLVM IR
+# file) using build command and options in given cmd_file, $kdir/.file.o.cmd.
+# If LLVM IR file, .ll extension, is given as input, this outputs object file.
+# In case of c file, .c extension, this outputs LLVM IR file.
+#
+# To build output, this parses $kdir/.file.o.cmd and uses command in it. This
+# script assumes that linux kernel is already built, which had created the
+# $kdir/.file.o.cmd files. Note that this script doesn't intercept CC cmd by
+# kbuild, which is different from livepatch-cc.
+
+#-------------------------------------------------------------
+# Shell setting
+#-------------------------------------------------------------
+set -E
+
+#-------------------------------------------------------------
+# Global variables
+#-------------------------------------------------------------
+declare -r G_KLP_COMPILE_CMD="$0"
+declare -r G_KLP_COMPILE_PATH=$(dirname $(readlink -f "${G_KLP_COMPILE_CMD}"))
+declare -r G_C_FILE_EXT='c'
+declare -r G_IR_FILE_EXT='ll'
+
+declare G_IN_FILE=""
+declare G_OUT_FILE=""
+declare G_CMD_FILE=""
+
+#-------------------------------------------------------------
+# Include library
+#-------------------------------------------------------------
+source "${G_KLP_COMPILE_PATH}/libutil.bash" "livepatch-compile"
+
+#-------------------------------------------------------------
+# Function definitions
+#-------------------------------------------------------------
+function cleanup()
+{
+	local errCode="${1:-}"
+	local lineNum="${2:-}"
+
+	[[ ${errCode} == 0 ]] || \
+		util::log_error "trap at line: ${lineNum}, with error:${errCode}."
+
+	exit "${errCode}"
+}
+# enable exit trap for debugging purpose
+trap 'cleanup $? ${LINENO}' ERR INT TERM EXIT
+
+function print_usage()
+{
+	cat <<EOF
+Usage: ${G_KLP_COMPILE_CMD} [OPTIONS] [FILE]
+Compile a [FILE], .ll (or .c), to .o (or .ll) file
+
+File: LLVM IR file or c file
+
+Options:
+  -c, --cmd_file Path to cmd_file, \$kdir/.file.o.cmd.
+                 Build command and options in this file are used.
+  -h, --help     This help message.
+  -o, --output   Path to an output file.
+EOF
+	return 0
+}
+
+function parse_options()
+{
+	local args
+
+	if [[ $# == 0 ]]; then
+		print_usage
+		exit 0
+	fi
+
+	args=$(getopt -q -n "${G_KLP_COMPILE_CMD}" -o h,c:,o: \
+		-l cmd_file:,help,output: \
+		-- "$@")
+
+	eval set -- "${args}"
+
+	while true; do
+		local arg="${1}"
+		shift
+		case "${arg}" in
+			-c|--cmd_file)
+				G_CMD_FILE="${1}"
+				shift
+				;;
+			-h|--help)
+				print_usage
+				exit 0
+				;;
+			-o|--output)
+				G_OUT_FILE="${1}"
+				shift
+				;;
+			*)
+				break;
+		esac
+	done
+
+	# The rest is an input file
+	G_IN_FILE="${1}"
+
+	echo ${G_IN_FILE}
+
+	# sanity checks for command line params
+	[[ -n "${G_IN_FILE}" ]] ||
+		util::error "input file is not given"
+	[[ -f "${G_IN_FILE}" ]] || \
+		util::error "${G_IN_FILE} doesn't exist."
+
+	[[ -n "${G_CMD_FILE}" ]] ||
+		util::error "cmd file is not given"
+	[[ -f "${G_CMD_FILE}" ]] || \
+		util::error "${G_CMD_FILE} doesn't exist."
+
+	[[ -n "${G_OUT_FILE}" ]] ||
+		util::error "output file is not given"
+	[[ ! -f "${G_OUT_FILE}" ]] || \
+		util::error "${G_OUT_FILE} exists."
+
+	return 0
+}
+
+#-------------------------------------------------------------
+# Main starts here
+#-------------------------------------------------------------
+parse_options "$@"
+
+declare -r IN_FILE_NO_EXT="${G_IN_FILE%.*}"
+declare -r IN_FILE_EXT="${G_IN_FILE##*.}"
+
+case "${IN_FILE_EXT}" in
+	"${G_C_FILE_EXT}"|"${G_IR_FILE_EXT}")
+		;;
+	*)
+		util::error \
+			"Invalid file type for input file, ${G_IN_FILE}"
+esac
+
+# only grep command line
+declare -ra ORIG_CMD_LINE=($(grep cmd_ "${G_CMD_FILE}"))
+[[ ${#ORIG_CMD_LINE[@]} != 0 ]] || \
+	util::error "cmd file, ${G_CMD_FILE}, doesn't have command line"
+
+eval set -- "${ORIG_CMD_LINE[@]}"
+
+shift # remove cmd_*
+shift # remove :=
+
+declare -r CC_CMD="${1}"
+shift
+
+if [[ ! "${CC_CMD}" =~ ^(.*-)?clang$ ]] ; then
+	util::error "clang is required: $(basename "${CC_CMD}")"
+fi
+
+[[ -x "${CC_CMD}" ]] || which "${CC_CMD}" >& /dev/null || \
+	util::error "compiler, $(basename "${CC_CMD}"), is not available"
+
+# command options in the \$kdir/.file.o.cmd are to build .o target. To build .ll
+# file, '-c' option should be replaced with '-S' and '-emit-llvm'.
+declare -a args=()
+while [ "$#" -gt 0 ]; do
+	case "${1}" in
+		'-c')
+			if [[ "${IN_FILE_EXT}" == "${G_C_FILE_EXT}" ]]; then
+				args+=("-S" "-emit-llvm")
+			else
+				args+=("-c")
+			fi
+			;;
+		'-g')
+			# .ll file is used to compute diff between original and
+			# patched. "-g" option makes clang to generate calls to
+			# llvm.dbg.*. This results in unnecessary diffs between the
+			# original and patched. So, removing "-g" option for c file input.
+			if [[ "${IN_FILE_EXT}" == "${G_IR_FILE_EXT}" ]]; then
+				args+=("-g");
+			fi
+			;;
+		*.c)
+			declare -r C_FILE="${1}"
+			[[ -f "${C_FILE}" ]] || \
+				util::error "${C_FILE} doesn't exists"
+			# ${G_IN_FILE} doesn't need to be in the same dir for
+			# ${C_FILE}. so, add include path here.
+			declare -r HEADER_PATH="$(dirname "${C_FILE}")"
+			args+=(-I "${HEADER_PATH}" "${G_IN_FILE}")
+			;;
+		*)
+			args+=("${1}");
+	esac
+	shift
+done
+
+# note that the last -o option is picked up by compiler for output
+# filename.
+"${CC_CMD}" "${args[@]}" "-o" "${G_OUT_FILE}"
+util::log_ok "Built ${G_OUT_FILE}"

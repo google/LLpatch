@@ -1,0 +1,510 @@
+#!/usr/bin/env bash
+#
+# Copyright 2021 Google LLC
+# 
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+# 
+#     https://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Author: yonghyun@google.com (Yonghyun Hwang)
+#
+# Wrapper script to generate a package for kernel livepatches
+
+#-------------------------------------------------------------
+# Shell setting
+#-------------------------------------------------------------
+set -E
+
+#-------------------------------------------------------------
+# Global variables
+#-------------------------------------------------------------
+declare -r G_LLPATCH_MERGE_CMD="$0"
+declare -r G_LLPATCH_PATH=$(dirname $(readlink -f "${G_LLPATCH_MERGE_CMD}"))
+declare -r G_LIVEPATCH_BIN="${G_LLPATCH_PATH}/livepatch"
+declare -r G_CREATE_PACKAGE="${G_LLPATCH_PATH}/create-package"
+declare -r G_TMP_DIR="$(mktemp -d -t livepatch.XXXXXXXXXX)"
+declare -r G_PREFIX_LLPATCH="llpatch"
+declare -r G_CMD_LOG_FILE="${G_TMP_DIR}/$(basename "${G_LLPATCH_MERGE_CMD}").cmds"
+
+declare -a G_KLP_DIRS=()
+declare G_BUILD_ARCH="x86_64"
+declare G_DEBUG_DIR=""
+declare G_KDIR="$(pwd)"
+declare G_ODIR=""
+declare G_LD_CMD=""
+declare G_KLP_NAME="klp_merge"
+declare G_SKIP_PKG_BUILD=false
+
+#-------------------------------------------------------------
+# Include library
+#-------------------------------------------------------------
+source "${G_LLPATCH_PATH}/libutil.bash" "llpatch-merge"
+
+#-------------------------------------------------------------
+# Function definitions
+#-------------------------------------------------------------
+function cleanup()
+{
+	local errCode="${1:-}"
+	local lineNum="${2:-}"
+
+	[[ ${errCode} == 0 ]] || \
+		util::log_error "trap at line: ${lineNum}, with error:${errCode}."
+
+	if [[ -n "${G_DEBUG_DIR}" ]]; then
+		sed -i -e "s|"${G_TMP_DIR}"|"${G_DEBUG_DIR}"|g" \
+			"${G_CMD_LOG_FILE}"
+		mv -f "${G_TMP_DIR}" "${G_DEBUG_DIR}"
+		G_DEBUG_DIR=""
+	else
+		rm -fr "${G_TMP_DIR}"
+	fi
+	exit "${errCode}"
+}
+# enable exit trap for debugging purpose
+trap 'cleanup $? ${LINENO}' ERR INT TERM EXIT
+
+function print_usage()
+{
+	cat <<EOF
+Usage: ${G_LLPATCH_MERGE_CMD} [OPTIONS] [KLP_DIRS]
+Build a package for kernel livepatch.
+
+KLP dirs: Output directories by llpatch with --skip-pkg-build option.
+
+Options:
+  --arch       CPU architecture for livepatch. arm64 and x86_64 are supported.
+               Default: ${G_BUILD_ARCH}
+  -n, --name   Name of kernel livepatch. Default: ${G_KLP_NAME}
+  -h, --help   This help message.
+  -k, --kdir   Path to kernel repository. If not specified, `pwd` is used.
+  -o, --odir   Path to output directory. If not specified, '$kdir/pkgs' is used.
+
+Developer Options:	(for internal testing, not production use)
+  --skip-pkg-build	Generate kernel livepatch source code rather than package
+  --debug-dir		Dir for debugging with all intermediate files for klp generation
+EOF
+	return 0
+}
+
+# run give command while logging it w/ its command line options.
+function run_command()
+{
+	{
+		echo "---"
+		echo $@
+		echo ""
+	} >> "${G_CMD_LOG_FILE}"
+	$@
+}
+
+function parse_options()
+{
+	local args
+
+	if [[ $# == 0 ]]; then
+		print_usage
+		exit 0
+	fi
+
+	args=$(getopt -q -n "${G_LLPATCH_MERGE_CMD}" -o h,k:,n:,o: \
+		-l arch:,debug-dir:,help,kdir:,name:,odir:,skip-pkg-build \
+		-- "$@")
+
+	if [[ $? == 1 ]]; then
+		print_usage
+		exit 0
+	fi
+	eval set -- "${args}"
+
+	while true; do
+		local arg="${1}"
+		shift
+		case "${arg}" in
+			--arch)
+				G_BUILD_ARCH="${1}"
+				shift
+				;;
+			--debug-dir)
+				G_DEBUG_DIR="${1}"
+				shift
+				;;
+			-h|--help)
+				print_usage
+				exit 0
+				;;
+			-k|--kdir)
+				G_KDIR="${1}"
+				shift
+				;;
+			-n|--name)
+				G_KLP_NAME="${1}"
+				shift
+				;;
+			-o|--odir)
+				G_ODIR="${1}"
+				shift
+				;;
+			--skip-pkg-build)
+				G_SKIP_PKG_BUILD=true
+				;;
+			*)
+				break;
+		esac
+	done
+
+	# The rest is patch dirs
+	G_KLP_DIRS=("$@")
+
+	return 0
+}
+
+function get_patch_file()
+{
+	local -r __KLP_DIR="${1}"
+	local -r __PATCH_FILE="${2}"
+	local -a __file=($(ls "${__KLP_DIR}"/*.${G_UTIL_SUFFIX_PATCH}))
+	[[ ${#__file[@]} == 1 ]] || \
+		util::error "there are ${#__file[@]} patch files. expecting just 1"
+	eval "${__PATCH_FILE}=${__file[0]}"
+}
+
+function validate_klp_dir()
+{
+	local -r KLP_DIR="${1}"
+
+	[[ -f "${KLP_DIR}/buildinfo" ]] || \
+		util::error "Dir, ${KLP_DIR}, doesn't have buildinfo."
+
+	[[ -f "${KLP_DIR}/klp_patch.o" ]] || \
+		util::error "Dir, ${KLP_DIR}, doesn't have klp_patch.o."
+
+	local patch_file=""
+	get_patch_file "${KLP_DIR}" "patch_file"
+	[[ -f "${patch_file}" ]] || \
+		util::error "Dir, ${KLP_DIR}, doesn't have patch file."
+
+	[[ -f "${KLP_DIR}/livepatch.c" ]] || \
+		util::error "Dir, ${KLP_DIR}, doesn't have livepatch.c."
+
+	[[ -f "${KLP_DIR}/livepatch.lds" ]] || \
+		util::error "Dir, ${KLP_DIR}, doesn't have livepatch.lds."
+	return 0
+}
+
+# validate options and prepare livepatch build
+function validate_prepare()
+{
+	local i=""
+	local -a tmp_patch_dirs=()
+	for i in ${G_KLP_DIRS[@]}; do
+		validate_klp_dir "${i}"
+		tmp_patch_dirs+=("$(readlink -f "${i}")")
+	done
+	G_KLP_DIRS=("${tmp_patch_dirs[@]}")
+
+	if [[ -n "${G_DEBUG_DIR}" ]]; then
+		[[ -e "${G_DEBUG_DIR}" ]] && \
+			util::error "Dir, ${G_DEBUG_DIR}, for debugging exists."
+		G_DEBUG_DIR="$(readlink -f ${G_DEBUG_DIR})"
+	fi
+
+	cd "${G_KDIR}" || \
+		util::error "Failed to cd onto git repository for kernel: ${G_KDIR}"
+
+	[[ -f MAINTAINERS && -d init ]] || \
+		util::error "Invalid git repository for kernel: $(pwd)"
+
+	case "${G_BUILD_ARCH}" in
+		arm64)
+			G_LD_CMD="aarch64-linux-gnu-ld"
+			;;
+		x86_64)
+			G_LD_CMD="ld"
+			;;
+		*)
+			util::error "unsupported architecture, ${G_BUILD_ARCH}"
+			;;
+	esac
+	if [[ -n "${LD:-}" ]]; then
+		util::log_warn "\$LD is defined. overriding 'ld' command"
+		G_LD_CMD="${LD}"
+	fi
+	which "${G_LD_CMD}" >& /dev/null || \
+		util::error "${G_LD_CMD} is not available"
+
+	if [[ ${G_SKIP_PKG_BUILD} == true ]]; then
+		[[ -n "${G_ODIR}" ]] || \
+			util::error "Output dir should be specified w/ --skip-pkg-build option."
+		[[ -d "${G_ODIR}" ]] && \
+			util::error "Outpu dir, ${G_ODIR}, already exists."
+	fi
+	if [[ -z "${G_ODIR}" ]]; then
+		G_ODIR="${G_KDIR}/pkgs"
+		util::log_info "Default output dir: ${G_ODIR}"
+	fi
+	G_ODIR="$(readlink -f ${G_ODIR})"
+
+	return 0
+}
+
+function get_buildinfo()
+{
+	echo "${G_TMP_DIR}/buildinfo"
+}
+
+function get_merged_patch()
+{
+	echo "${G_TMP_DIR}/${G_KLP_NAME}.${G_UTIL_SUFFIX_PATCH}"
+}
+
+function merge_livepatches()
+{
+	util::log_info "Start merging livepatches"
+
+	# merging buildinfo, ld scripts, and klp_patch.o.
+	local patch=""
+	local klp_dir=""
+	local -r LIVEPATCH_LDS="${G_TMP_DIR}/livepatch.lds"
+	local -r KLP_PATCH_OBJ="klp_patch.o"
+	for klp_dir in ${G_KLP_DIRS[@]}; do
+		get_patch_file "${klp_dir}" "patch"
+
+		# merge patch file
+		cat "${patch}" >> $(get_merged_patch)
+
+		# merge buildifo
+		{
+			echo "$(basename ${patch})"
+			echo "-------------------"
+			cat "${klp_dir}/buildinfo"
+			echo ""
+		} >> "$(get_buildinfo)"
+		# merge ld scripts
+		grep '^livepatch_' "${klp_dir}/livepatch.lds" >> \
+			 "${LIVEPATCH_LDS}"
+		# collect klp_patch.o
+		klp_patches+=("${klp_dir}/${KLP_PATCH_OBJ}")
+	done
+	# merge klp_patch.o
+	"${G_LD_CMD}" -r -o "${G_TMP_DIR}/${KLP_PATCH_OBJ}" "${klp_patches[@]}"
+
+	util::log_ok "Livepatch merging complete"
+	return 0
+}
+
+function get_obj_func_name()
+{
+	local obj_name="${1}"
+	echo "${obj_name}_funcs"
+}
+
+function generate_livepatch_wrapper()
+{
+	util::log_info "Generate livepatch wrapper"
+	local -r LIVEPATCH="livepatch.c"
+	local -r LIVEPATCH_WRAPPER="${G_TMP_DIR}/${LIVEPATCH}"
+	local -r LIVEPATCH_TEMPLATE="${G_LLPATCH_PATH}/templates/livepatch.c.tmpl"
+
+	# generate #include && comments
+	sed '/{{LIST_OF_LIVEPATCH_FUNCTIONS}}/Q' \
+		"${LIVEPATCH_TEMPLATE}" >> "${LIVEPATCH_WRAPPER}"
+
+	# generate list of livepatch functions
+	local klp_dir=""
+	for klp_dir in ${G_KLP_DIRS[@]}; do
+		grep '^void livepatch_' "${klp_dir}/${LIVEPATCH}"
+	done >> "${LIVEPATCH_WRAPPER}"
+
+	# construct map of klp objs, while expecting the following source code
+	#
+	# static struct klp_object objs[] = {
+	# 	{
+	# 		.name = $kmod_name, // NULL or "kmod_name"
+	# 		.funcs = funcs,
+	# 	},
+	# 	{}
+	# };
+	local -r OBJ_NAME_SEP=":::"
+	local -A obj_patch_map
+	for klp_dir in ${G_KLP_DIRS[@]}; do
+		# get name of object.
+		local obj_name=$(
+			awk <"${klp_dir}/${LIVEPATCH}" "
+			BEGIN {hit = 0}
+			/static struct klp_object objs/ { hit = 1; }
+			/\t\t.name =/ { if (hit == 1) {print \$3; hit--; exit 0} }
+			END {if (hit < 0) exit 1}
+			")
+
+		# ".name = NULL," or ".name = $kmod_name,". so, it should end with ","
+		# remove ","
+		obj_name=${obj_name%,}
+
+		obj_patch_map[${obj_name}]="${obj_patch_map[${obj_name}]}${OBJ_NAME_SEP}${klp_dir}"
+	done
+
+	# generate struct klp_func, while expecting the follwoing source code
+	#
+	# static struct klp_func funcs[] = {
+	# 	{
+	# 		.old_name = "${klp_func_name}",
+	# 		.new_func = livepatch_${klp_func_name},
+	# 		...,
+	# 	},
+	# 	{}
+	# };
+	local obj_name=""
+	local klp_dir_list=""
+	for obj_name in ${!obj_patch_map[@]}; do
+		klp_dir_list="${obj_patch_map[${obj_name}]}"
+		# klp_dir_list starts with ${OBJ_NAME_SEP}. so, remove it first
+		klp_dir_list=${klp_dir_list#${OBJ_NAME_SEP}}
+
+		obj_name="${obj_name#\"}"
+		obj_name="${obj_name%\"}"
+
+		# iterate through klp dirs for ${obj_name}
+		printf "static struct klp_func $(get_obj_func_name "${obj_name}")[] = {\n"
+		while true; do
+			klp_dir=${klp_dir_list%%${OBJ_NAME_SEP}*}
+			klp_dir_list=${klp_dir_list#*${OBJ_NAME_SEP}}
+
+			# dump "static struct klp_func" for given klp dir. The awk assumes specific
+			# formats for "struct klp_func funcs[]" in ${klp_dir}/${LIVEPATCH}. If
+			# $llpatch/tempates/livepatch.c.tmpl is updated, The following awk process
+			# should be updated as well.
+			awk <"${klp_dir}/${LIVEPATCH}" "
+				BEGIN {hit = 0}
+				/static struct klp_func funcs/ {hit = 1}
+				/\t\{\}/ { hit--; exit 0 }
+				/\t/ { if (hit >= 1) print \$0 }
+				END { if (hit != 0) exit 1}
+				" || util::error "Cannot Parse klp_func tables"
+
+			if [[ "${klp_dir}" == "${klp_dir_list}" ]]; then
+				break
+			fi
+		done
+		printf "\t{}\n};\n"
+	done >> "${LIVEPATCH_WRAPPER}"
+
+	# generate struct klp_obj
+	printf "static struct klp_object objs[] = {\n" >> "${LIVEPATCH_WRAPPER}"
+	for obj_name in ${!obj_patch_map[@]}; do
+		printf "\t{\n"
+		printf "\t\t.name = ${obj_name},\n"
+
+		obj_name="${obj_name#\"}"
+		obj_name="${obj_name%\"}"
+		printf "\t\t.funcs = $(get_obj_func_name "${obj_name}"),\n"
+
+		printf "\t},\n"
+	done >> "${LIVEPATCH_WRAPPER}"
+	printf "\t{}\n};\n" >> "${LIVEPATCH_WRAPPER}"
+
+	# dump till the end of template for livepatch_init() && livepatch_exit()
+	sed -n '/^static struct klp_patch patch/,$p' \
+		"${LIVEPATCH_TEMPLATE}" >> "${LIVEPATCH_WRAPPER}"
+
+	util::log_ok "Livepatch wrapper complete"
+	return 0
+}
+
+function get_klp_name()
+{
+	echo ${G_PREFIX_LLPATCH}-${G_KLP_NAME}
+}
+
+function generate_makefile()
+{
+	util::log_info "Generate makefile for livepatch"
+	local -r MAKEFILE="${G_TMP_DIR}/Makefile"
+	local -r MAKEFILE_TEMPLATE="${G_LLPATCH_PATH}/templates/Makefile.tmpl"
+
+	cp "${MAKEFILE_TEMPLATE}" "${MAKEFILE}"
+	sed -i -e "s|{{PATH_TO_LINUX_KERNEL_SOURCE_TREE}}|${G_KDIR}|g" \
+		-e "s|{{NAME_OF_LIVEPATCH}}|$(get_klp_name)|g" \
+		"${MAKEFILE}"
+
+	util::log_ok "Makefile for livepatch complete"
+	return 0
+}
+
+function build_livepatch()
+{
+	util::log_info "Building kernel livepatch"
+	# for now, use kbuild only for arm64.
+	if [[ ${G_BUILD_ARCH} == "arm64" ]]; then
+		make ARCH=arm64 M="${G_TMP_DIR}"
+	else
+		# "-C ${G_TMP_DIR}" for make doesn't work for kernel module build here
+		pushd "${G_TMP_DIR}" >& /dev/null
+		"${MAKE:-make}" CLANG=1 LLVM=1
+		popd  >& /dev/null
+	fi
+
+	# before fixing up, make a backup
+	util::log_info "Creating KLP rela section"
+
+	local -r KLP_MOD_NAME="$(get_klp_name).ko"
+	cp -f "${G_TMP_DIR}/${KLP_MOD_NAME}" "${G_TMP_DIR}/${KLP_MOD_NAME}.bak"
+	run_command "${G_LIVEPATCH_BIN}" fixup -q --rela "${G_TMP_DIR}/${KLP_MOD_NAME}"
+
+	util::log_ok "Kernel livepatch is built"
+}
+
+function build_package()
+{
+	util::log_info "Build livepatch package"
+
+	local -r BUILDINFO="$(get_buildinfo)"
+	local -r KERNEL_RELEASE="$(strings "init/version.o" | awk '/^Linux version/ { print $3 }')"
+	local -r KLP_FILE="${G_TMP_DIR}/$(get_klp_name).ko"
+	local -r PACKAGE_BASENAME="${KERNEL_RELEASE}.${G_BUILD_ARCH}"
+	local -r PKG_TARBALL="${G_ODIR}/kernelpatch-$(util::get_livepatch_name "$(get_klp_name)")-${PACKAGE_BASENAME}.msvp.tar.xz"
+
+	mkdir -p "${G_ODIR}"
+	run_command "${G_CREATE_PACKAGE}" "${KLP_FILE}" \
+		  --buildinfo "${BUILDINFO}" \
+		  --patch "$(get_merged_patch)" \
+		  --output "${PKG_TARBALL}" \
+		  --debug-dir "${G_TMP_DIR}"
+
+	util::log_ok "All done :)"
+	return 0
+}
+
+#-------------------------------------------------------------
+# Main starts here
+#-------------------------------------------------------------
+# before doing anything create a log file first
+> "${G_CMD_LOG_FILE}"
+
+parse_options "$@"
+
+validate_prepare
+
+merge_livepatches
+
+generate_livepatch_wrapper
+
+generate_makefile
+
+if [[ ${G_SKIP_PKG_BUILD} == false ]]; then
+	build_livepatch
+	build_package
+else
+	# cleanup will put generated files under ${G_ODIR}
+	G_DEBUG_DIR="${G_ODIR}"
+fi
+
+exit 0

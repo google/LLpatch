@@ -1,0 +1,8 @@
+livepatch
+GPATH
+GRTAGS
+GTAGS
+*.diff
+*.patch
+*.a
+.build

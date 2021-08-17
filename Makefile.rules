@@ -1,0 +1,164 @@
+# Copyright 2021 Google LLC
+# 
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+# 
+#     https://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# -------------------------------------------------------------------------
+# Makefile.rule: common build rules
+#
+# Author: yonghyun@google.com (Yonghyun Hwang)
+# -------------------------------------------------------------------------
+
+# --------------------------------------------
+# Magic part: please don't touch if you don't know what you are doing
+# --------------------------------------------
+
+ifeq (,$(PRJ_ROOT_DIR))
+  $(error "PRJ_ROOT_DIR should be defined before including Makefile.rules file")
+endif
+include $(PRJ_ROOT_DIR)/Makefile.macros
+
+# -----------------------
+# define utility functions
+define iterate_dirs
+	set -e ; for d in $(2); do \
+	  $(MAKE) -C $$d $(1); \
+	done
+endef
+
+PLATFORM = linux64
+CONFIG   = debug
+
+define print_help
+	$(ECHO) "Build targets for" $(1)
+	$(ECHO) ""
+	$(ECHO) "  all         build" $(1)
+	$(ECHO) "  clean       clean all .o files"
+	$(ECHO) "  distclean   clean all files generated during build"
+	$(ECHO) "  help        display this message (default)"
+	$(ECHO) ""
+	$(ECHO) "Build options"
+	$(ECHO) ""
+	$(ECHO) "  PLATFORM = [linux64|linux]  default is linux64"
+	$(ECHO) "  CONFIG   = [debug|optimize] default is debug"
+	$(ECHO) ""
+	$(ECHO) "Examples"
+	$(ECHO) ""
+	$(ECHO) "  make all                           # debug linux64 build"
+	$(ECHO) "  make CONFIG=optimize all           # optimize linux64 build"
+	$(ECHO) "  make PLATFORM=linux all            # debug linux build"
+	$(ECHO) ""
+endef
+
+PRT_PREFIX := "`hostname`[`date +'%m/%d %H:%M'`]::BUILD"
+define print_info_msg
+	@$(ECHO) "$(PRT_PREFIX)[INFO]::" $(1)
+endef
+
+define print_warn_msg
+	@$(ECHO) "$(PRT_PREFIX)[WARN]::" $(1)
+endef
+
+define platform_not_support
+help all install clean distclean test:
+	$$(call print_info_msg, "platforms other than linux* are not supported for now")
+endef
+
+# actual body of generic build rules for all lib build
+define play_magic
+
+ifneq (,$$(filter linux%,$$(BUILD_PLATFORM)))
+
+ifeq ($$(LIB_NAME),)
+all: $$(EXE)
+	$$(call print_info_msg, "$$(EXE) is created")
+else
+all: $$(LIB_NAME)
+	$$(call print_info_msg, "lib$$(LIB_NAME).a is created")
+endif
+
+
+$$(BUILD_DIR): ; @$$(MKDIR) $$@
+
+ifeq ($(SRCS),)
+$$(EXE):
+	@$$(call iterate_dirs, all, $$(SUB_DIRS))
+	$$(call print_info_msg, "nothing to build here")
+
+$$(LIB_NAME):
+	@$$(call iterate_dirs, all, $$(SUB_DIRS))
+	$$(call print_info_msg, "nothing to build here")
+
+else
+$$(EXE): $$(OBJS)
+	@$$(call iterate_dirs, all, $$(SUB_DIRS))
+	@$$(CXX) -o $$@ $$^ $$(LOCAL_LIB)
+
+$$(LIB_NAME): CFLAGS+=-fPIC
+$$(LIB_NAME): CXXFLAGS+=-fPIC
+$$(LIB_NAME): $$(OBJS)
+	@$$(call iterate_dirs, all, $$(SUB_DIRS))
+	@$$(AR) -crs lib$$@.a $$^
+endif
+
+$$(OBJS): | $$(BUILD_DIR)
+
+clean:
+	@$$(call iterate_dirs, $$@, $$(SUB_DIRS))
+	@$$(RM) -r $$(BUILD_DIR)/*.o
+ifneq ($$(LIB_NAME),)
+	@$$(RM) -f lib$$(LIB_NAME).a
+endif
+	$$(call print_info_msg, "$(1) is $$@ed")
+
+distclean:
+	@$$(call iterate_dirs, $$@, $$(SUB_DIRS))
+	@$$(RM) -r $$(BUILD_DIR_ROOT) $$(EXE)
+ifneq ($$(LIB_NAME),)
+	@$$(RM) -f lib$$(LIB_NAME).a
+endif
+	$$(call print_info_msg, "$(1) is $$@ed")
+
+help:
+	@$$(call print_help, "$(1)")
+
+else # platforms other than linux* are not supported
+  $$(eval $$(call platform_not_support))
+endif
+
+endef
+
+# default targets
+.PHONY: help all install clean distclean
+
+.DEFAULT_GOAL := help
+
+# compiling obj files & its dep
+$(BUILD_DIR)/%.o: %.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(PRJ_LOCAL_INC) $(LOCAL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/%.o: %.cc
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(PRJ_LOCAL_INC) $(LOCAL_CXXFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/%.o: %.cpp
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(PRJ_LOCAL_INC) $(LOCAL_CXXFLAGS) -c $< -o $@
+
+%.o: %.c
+	$(call print_warn_msg, "should not fall here. critical error in build system")
+
+%.o: %.cc
+	$(call print_warn_msg, "should not fall here. critical error in build system")
+
+%.o: %.cpp
+	$(call print_warn_msg, "should not fall here. critical error in build system")
+
+# include auto gen-ed dep files
+-include $(DEPS)

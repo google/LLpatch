@@ -1,0 +1,1059 @@
+#!/usr/bin/env bash
+#
+# Copyright 2021 Google LLC
+# 
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+# 
+#     https://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Author: yonghyun@google.com (Yonghyun Hwang)
+#
+# Wrapper script to generate a package for kernel livepatch
+
+#-------------------------------------------------------------
+# Shell setting
+#-------------------------------------------------------------
+set -E
+
+#-------------------------------------------------------------
+# Global variables
+#-------------------------------------------------------------
+declare -r G_LIVEPATCH_CMD="$0"
+declare -r G_LIVEPATCH_CMDLINE="$0 $@"
+declare -r G_LIVEPATCH_PATH=$(dirname $(readlink -f "${G_LIVEPATCH_CMD}"))
+declare -r G_LIVEPATCH_BIN="${G_LIVEPATCH_PATH}/livepatch"
+declare -r G_LIVEPATCH_CC="${G_LIVEPATCH_PATH}/livepatch-cc"
+declare -r G_LIVEPATCH_COMPILE="${G_LIVEPATCH_PATH}/livepatch-compile"
+declare -r G_LIVEPATCH_MERGE="${G_LIVEPATCH_PATH}/llpatch-merge"
+declare -r G_CREATE_PACKAGE="${G_LIVEPATCH_PATH}/create-package"
+declare -r G_SCRIPT_VERSION="$(sha1sum "$0" | cut -d' ' -f1)"
+declare -r G_TMP_DIR="$(mktemp -d -t livepatch.XXXXXXXXXX)"
+declare -r G_SUFFIX_ALIGNED="__aligned"
+declare -r G_SUFFIX_ORIGINAL="__original"
+declare -r G_SUFFIX_PATCHED="__patched"
+declare -r G_SUFFIX_LLVM_IR_ORIGINAL="${G_SUFFIX_ORIGINAL}.ll"
+declare -r G_SUFFIX_LLVM_IR_PATCHED="${G_SUFFIX_PATCHED}.ll"
+declare -r G_SUFFIX_KLP_DIFF=".c__klp_diff"
+declare -r G_KLP_PATCH_OBJ="klp_patch.o"
+declare -r G_KERNEL_VMLINUX="vmlinux"
+declare -r G_EMPTY_LIVEPATCH="empty_livepatch"
+declare -r G_CMD_LOG_FILE="${G_TMP_DIR}/$(basename "${G_LIVEPATCH_CMD}").cmds"
+declare G_THIN_ARCHIVE=""
+declare G_PATCH_FILE
+declare G_TMP_CMD_FILE_LIST="$(mktemp -t kernel.o.cmds.XXXXXXXXXX)"
+declare -i G_PATCHED_DIRTY=0
+declare G_KDIR="$(pwd)"
+declare G_ODIR=""
+# This specifies directory for debugging where all intermediate files for
+# livepatch generation are available. Basically, ${G_DEBUG_DIR} has all
+# contents of ${G_TMP_DIR}.
+declare G_DEBUG_DIR
+declare -r G_TMP_MERGE_DIR="$(mktemp -d -t livepatch.merge.XXXXXXXXXX)"
+declare G_LD_CMD=""
+declare G_NM_CMD=""
+
+# list of paths to patched files without .c extension
+declare -a G_PATCHED_FILES=()
+declare -A G_PATCHED_FILE_SET
+declare -A G_OBJ_PATCHED_MAP
+declare -r G_FILE_SEP=":::"
+declare -r G_OBJ_PATCHED_MAP_FILE="obj_patched_map.txt"
+
+declare G_BUILD_ARCH="x86_64"
+declare G_SKIP_PKG_BUILD=false
+declare G_IS_SLOW_PATH=false
+declare G_MULTI_CHANGE=false
+
+#-------------------------------------------------------------
+# Include library
+#-------------------------------------------------------------
+source "${G_LIVEPATCH_PATH}/libutil.bash" "llpatch"
+
+#-------------------------------------------------------------
+# Function definitions
+#-------------------------------------------------------------
+function cleanup()
+{
+	local errCode="${1:-}"
+	local lineNum="${2:-}"
+
+	[[ ${errCode} == 0 ]] || \
+		util::log_error "trap at line: ${lineNum}, with error:${errCode}."
+
+	if [[ ${G_PATCHED_DIRTY} == 1 ]]; then
+		patch -R -p1 -d "${G_KDIR}" -i "${G_PATCH_FILE}"
+		G_PATCHED_DIRTY=0
+	fi
+
+	rm -f "${G_TMP_CMD_FILE_LIST}"
+	rm -fr "${G_TMP_MERGE_DIR}"
+	if [[ -n "${G_DEBUG_DIR}" ]]; then
+		sed -i -e "s|"${G_TMP_DIR}"|"${G_DEBUG_DIR}"|g" \
+			-e "s|"${G_TMP_MERGE_DIR}"|"${G_DEBUG_DIR}"|g" \
+			"${G_CMD_LOG_FILE}"
+		mv -f "${G_TMP_DIR}" "${G_DEBUG_DIR}"
+		G_DEBUG_DIR=""
+	else
+		rm -fr "${G_TMP_DIR}"
+	fi
+	exit "${errCode}"
+}
+# enable exit trap for debugging purpose
+trap 'cleanup $? ${LINENO}' ERR INT TERM EXIT
+
+function print_usage()
+{
+	cat <<EOF
+Usage: ${G_LIVEPATCH_CMD} [OPTIONS] [FILE]
+Build a package for kernel livepatch.
+
+File: .patch file to use for the livepatch package build.
+      The patch is applied temporarily to kernel.
+
+Options:
+  --arch       CPU architecture for livepatch. arm64 and x86_64 are supported.
+               Default is x86_64.
+  -h, --help   This help message.
+  -k, --kdir   Path to kernel repository. If not specified, `pwd` is used.
+  -o, --odir   Path to output directory. If not specified, '$kdir/pkgs' is used.
+
+Developer Options:	(for internal testing, not production use)
+  --multi		Allow changes in multiple kmods and/or vmlinux
+			This is highly discouraged option to avoid "large" livepatch
+  --skip-pkg-build	Produce livepatch-<diffname>.ko rather than livepatch package
+  --slow-path		use kbuild to build llvm ir files
+  --debug-dir		Dir for debugging with all intermediate files for klp generation
+EOF
+	return 0
+}
+
+# run give command while logging it w/ its command line options.
+function run_command()
+{
+	{
+		echo "---"
+		echo $@
+		echo ""
+	} >> "${G_CMD_LOG_FILE}"
+	$@
+}
+
+function parse_options()
+{
+	local args
+
+	if [[ $# == 0 ]]; then
+		print_usage
+		exit 0
+	fi
+
+	args=$(getopt -q -n "${G_LIVEPATCH_CMD}" -o h,k:,o: \
+		-l arch:,debug-dir:,help,kdir:,multi,odir:,skip-pkg-build,slow-path \
+		-- "$@")
+
+	if [[ $? == 1 ]]; then
+		print_usage
+		exit 0
+	fi
+	eval set -- "${args}"
+
+	while true; do
+		local arg="${1}"
+		shift
+		case "${arg}" in
+			--arch)
+				G_BUILD_ARCH="${1}"
+				shift
+				;;
+			--debug-dir)
+				G_DEBUG_DIR="${1}"
+				shift
+				;;
+			-h|--help)
+				print_usage
+				exit 0
+				;;
+			-k|--kdir)
+				G_KDIR="${1}"
+				shift
+				;;
+			--multi)
+				G_MULTI_CHANGE=true
+				;;
+			-o|--odir)
+				G_ODIR="${1}"
+				shift
+				;;
+			--skip-pkg-build)
+				G_SKIP_PKG_BUILD=true
+				;;
+			--slow-path)
+				G_IS_SLOW_PATH=true
+				;;
+			*)
+				break;
+		esac
+	done
+
+	# The rest is a patch file
+	G_PATCH_FILE="$(readlink -f ${1})"
+
+	# TODO: support slow path using kbuild
+	[[ ${G_IS_SLOW_PATH} == false ]] || \
+		util::error "Slow path is not supported for now"
+
+	util::log_ok "Command line options are parsed."
+	return 0
+}
+
+function check_arch_for_current_kbuild()
+{
+	local -r ARCH="${1}"
+	grep -q -i "CONFIG_${ARCH}=y" .config
+}
+
+# validate options and prepare livepatch build
+function validate_prepare()
+{
+	[[ -f "${G_PATCH_FILE}" ]] || \
+		util::error "Given patch file doesn't exist."
+	G_PATCH_FILE="$(readlink -f "${G_PATCH_FILE}")"
+	[[ $(file -b --mime-type "${G_PATCH_FILE}") =~ text.*diff$ ]] || \
+		util::error "Invalid patch file format."
+
+	if [[ -n "${G_DEBUG_DIR}" ]]; then
+		[[ -e "${G_DEBUG_DIR}" ]] && \
+			util::error "Dir, ${G_DEBUG_DIR}, for debugging exists."
+		G_DEBUG_DIR="$(readlink -f ${G_DEBUG_DIR})"
+	fi
+
+	cd "${G_KDIR}" || \
+		util::error "Failed to cd onto git repository for kernel: ${G_KDIR}"
+
+	# create list of .*.o.cmd files
+	find -type f -name '.*.o.cmd' >| "${G_TMP_CMD_FILE_LIST}"
+	[[ $(cat "${G_TMP_CMD_FILE_LIST}" | wc -l) != 0 ]] || \
+		util::error "There is no .*.o.cmd files. Please build kernel first"
+
+	[[ -f MAINTAINERS && -d init ]] || \
+		util::error "Invalid git repository for kernel: $(pwd)"
+
+	# llpatch expects .config is already available because livepatch only has meaning
+	# wrt a base kernel.
+	[[ -f .config ]] || \
+		util::error "kernel config, .config, is not available."
+
+	# TODO: build the binary instead of checking it.
+	if [[ ! -x "${G_LIVEPATCH_BIN}" ]]; then
+		util::log_info "Build livepatch binary first."
+		"${MAKE:-make}" -C "${G_LIVEPATCH_PATH}" all
+		util::log_ok "livepatch binary is built."
+	fi
+
+	case "${G_BUILD_ARCH}" in
+		arm64)
+			G_LD_CMD="aarch64-linux-gnu-ld"
+			G_NM_CMD="aarch64-linux-gnu-nm"
+			;;
+		x86_64)
+			G_LD_CMD="ld"
+			G_NM_CMD="nm"
+			;;
+		*)
+			util::error "unsupported architecture, ${G_BUILD_ARCH}"
+			;;
+	esac
+	check_arch_for_current_kbuild "${G_BUILD_ARCH}" || \
+		util::error "kernel was built w/ a different ARCH"
+
+	if [[ -n "${LD:-}" ]]; then
+		util::log_warn "\$LD is defined. overriding 'ld' command"
+		G_LD_CMD="${LD}"
+	fi
+	which "${G_LD_CMD}" >& /dev/null || \
+		util::error "${G_LD_CMD} is not available"
+
+	if [[ -n "${NM:-}" ]]; then
+		util::log_warn "\$NM is defined. overriding 'nm' command"
+		G_NM_CMD="${NM}"
+	fi
+	which "${G_NM_CMD}" >& /dev/null || \
+		util::error "${G_NM_CMD} is not available"
+
+	if patch -N -p1 -d "${G_KDIR}" --dry-run -i "${G_PATCH_FILE}" | \
+			grep -q "^Hunk.*lines)\.$"; then
+		local patch_file=`basename "${G_PATCH_FILE}"`
+		util::log_warn "Fuzz matching is required for ${patch_file}"
+		patch -N -p1 -d "${G_KDIR}" --dry-run -i "${G_PATCH_FILE}"
+		util::error "Update ${patch_file} with \`update-patch\`"
+	fi
+
+	if [[ ${G_SKIP_PKG_BUILD} == true ]]; then
+		[[ -n "${G_ODIR}" ]] || \
+			util::error "Output dir should be specified w/ --skip-pkg-build option."
+		[[ -d "${G_ODIR}" ]] && \
+			util::error "Outpu dir, ${G_ODIR}, already exists."
+	fi
+	if [[ -z "${G_ODIR}" ]]; then
+		G_ODIR="${G_KDIR}/pkgs"
+		util::log_info "Default output dir: ${G_ODIR}"
+	fi
+	G_ODIR="$(readlink -f ${G_ODIR})"
+
+	util::log_ok "Options and preconditions for livepatch are checked."
+	return 0
+}
+
+# convert path to patched file to .*.o.cmd file
+function cmd_file_path()
+{
+	local -r FILE_PATH="${1}"
+	echo "$(dirname "${FILE_PATH}")/.$(basename "${FILE_PATH}").cmd"
+}
+
+# do reverse operation of cmd_file_path
+function un_cmd_file_path()
+{
+	local -r CMD_PATH="${1}"
+	local CMD_FILE="$(basename "${CMD_PATH}")"
+	CMD_FILE="${CMD_FILE:1}" # remove the prefix '.' in the name
+	CMD_FILE="${CMD_FILE%%\.cmd}" # remove the suffix .o.cmd in the name
+	echo "$(dirname "${CMD_PATH}")/${CMD_FILE}"
+}
+
+function get_affected_files()
+{
+	local h_file="${1}"
+
+	local -a affected_files=()
+	local cmd_file
+	for cmd_file in $(cat "${G_TMP_CMD_FILE_LIST}" | \
+			xargs grep -l "${h_file}" || test $? != 2); do
+		cmd_file=$(un_cmd_file_path "${cmd_file}")
+		cmd_file=${cmd_file%.o}
+		cmd_file=${cmd_file#./}
+		affected_files+=("${cmd_file}")
+	done
+
+	echo "${affected_files[@]}"
+}
+
+function handle_header_file_change()
+{
+	local h_file="${1}"
+
+	util::log_info "header file ${h_file} is changed"
+	local -a affected_files=($(get_affected_files "${h_file}"))
+
+	local file
+	for file in "${affected_files[@]}"; do
+		G_PATCHED_FILE_SET["${file}"]="${file}"
+	done
+
+	util::log_info "Affected files by ${h_file}:"
+	printf "\t${affected_files[@]}\n"
+	return 0
+}
+
+# parse patch file and return list for changed files
+function generate_patched_file_list()
+{
+	local patched_file
+	for patched_file in $(diffstat -p1 -l <"${G_PATCH_FILE}"); do
+		local patched_file_no_c_ext="${patched_file%.c}"
+		local patched_file_no_h_ext="${patched_file%.h}"
+
+		[[ "${patched_file}" != "${patched_file_no_c_ext}" ]] || \
+			[[ "${patched_file}" != "${patched_file_no_h_ext}" ]] || \
+			util::error "Only .c or .h file change is allowed. Changed: ${patched_file}."
+
+		if [[ "${patched_file}" == "${patched_file_no_c_ext}" ]]; then
+			# .h file is changed:
+			handle_header_file_change "${patched_file}"
+		else
+			G_PATCHED_FILE_SET["${patched_file_no_c_ext}"]="${patched_file_no_c_ext}"
+		fi
+	done
+
+	for patched_file in ${!G_PATCHED_FILE_SET[@]}; do
+		G_PATCHED_FILES+=("${patched_file}")
+	done
+
+	util::log_info "List of patched files without .c extension: "
+	for i in "${G_PATCHED_FILES[@]}"; do
+		printf "\t${i}\n"
+	done
+}
+
+# takes two parameter: first: path to file "with" .o extension, second:
+# "name" of variable to return a name for object parent.
+#
+# Assumption: given patched file __does not__ have more than two
+# parents. e.g., obj.o is a part of library used for kmod1.ko, kmod2.ko,
+# ...
+#
+# NOTE: this function puts prefix, __, to its local variables to avoid
+# naming collision with the name for return value.
+function __find_obj_parent()
+{
+	# given patched file is its own object parent.
+	local __obj_parent="${1}"
+	local -r __RETVAL="${2}"
+
+	# starting from dir where the given patched file lives, search the dir
+	# and its parent dir.
+	local __parent_dir="$(dirname "${__obj_parent}")"
+	local __cmd_file="$(cmd_file_path "${__obj_parent}")"
+	while [[ ! -e "${__parent_dir}/MAINTAINERS" ]]; do
+		util::log_info "Looking at ${__parent_dir} for parent object for ${__cmd_file}"
+
+		# cmd files in parent dir except __cmd_file
+		local -a __cmd_files=($(find "${__parent_dir}" -maxdepth 1 \
+						-name '.*.o.cmd' -a \
+						-not -name $(basename "${__cmd_file}")))
+		# now following .*.o.cmd file in ${__cmd_files[@]} to find object
+		# parent.
+		while [[ ${#__cmd_files[@]} != 0 ]]; do
+			local __un_cmd_file="$(un_cmd_file_path "${__cmd_file}")"
+			# file path to ko file path
+			if [[ -f "${__un_cmd_file%.o}.ko" ]]; then
+				# now found its parent! exit here
+				eval "${__RETVAL}"="${__un_cmd_file%.o}.ko"
+				return
+			fi
+
+			if ! grep -lw "${__un_cmd_file}" "${__cmd_files[@]}" >& /dev/null; then
+				# no more parent is available for
+				# ${__un_cmd_file}.o. hence, break to go to upper dir.
+				break
+			fi
+
+			local -a __parent_cmd_files=($(grep -lw "${__un_cmd_file}" "${__cmd_files[@]}"))
+			if [[ ${#__parent_cmd_files[@]} == 1 ]]; then
+				__cmd_file="${__parent_cmd_files[0]}"
+				__cmd_files=($(find "${__parent_dir}" -maxdepth 1 \
+							-name '.*.o.cmd' -a \
+							-not -name $(basename "${__cmd_file}")))
+			else
+				util::error "${__un_cmd_file} has ${#__parent_cmd_files[@]} parents"
+			fi
+		done
+
+		# goes to parent dir using `dirname`
+		__parent_dir=$(dirname "${__parent_dir}")
+		if [[ -z ${__parent_dir} ]]; then
+			# this is required for the condition for while loop.
+			__parent_dir="./"
+		fi
+	done
+
+	# couldn't file kernel module w/ the changes in given patched
+	# file. default to 'vmlinux'
+	eval "${__RETVAL}"="${G_KERNEL_VMLINUX}"
+}
+
+# find object parent, either *.ko or vmlinux, that contains the changes for
+# "${PATCHED_FILES[@]}". The object parent is used to fixup livepatched
+# symbols that needs the name of the parent in its name. This is essential
+# to resolve the addresses for livepatched symbols in kernel where there
+# could be couple of symbols with the same name.
+#
+# NOTE: for now, llpatch allows changes in either "single" kernel module
+# or vmlinux. not both. in case of both, it errors out. This is intentional
+# to ensure that KLP completes transition shortly.
+function find_obj_patched_map()
+{
+	local -ra PATCHED_FILES=("$@")
+
+	[[ ${#PATCHED_FILES[@]} == 0 ]] &&
+		util::error "no files are patched"
+
+	util::log_info "Searching for object parent for patched files"
+
+	# recall that ${PATCHED_FILES[0]} is list of files __without__ its
+	# extension
+	local obj_parent=""
+	local i=""
+	for i in "${PATCHED_FILES[@]}"; do
+		# recall that ${PATCHED_FILES[0]} is list of files __without__ its
+		# extension
+		obj_parent=""
+		__find_obj_parent "${i}.o" "obj_parent"
+		G_OBJ_PATCHED_MAP["${obj_parent}"]="${G_OBJ_PATCHED_MAP[${obj_parent}]}${G_FILE_SEP}${i}"
+	done
+
+	util::log_ok "Finalized map from obj to patched"
+	local -a patched_files=()
+	for obj_name in ${!G_OBJ_PATCHED_MAP[@]}; do
+		patched_files=($(util::parse_map_elements \
+						 "${G_FILE_SEP}" "${G_OBJ_PATCHED_MAP[${obj_name}]}"))
+		printf "\t${obj_name}:"
+		for i in "${patched_files[@]}"; do
+			printf " $i"
+		done
+		echo ""
+	done
+	echo ""
+}
+
+function dump_obj_patched_map()
+{
+	declare obj_name=""
+	declare -a patched_files=()
+	for obj_name in ${!G_OBJ_PATCHED_MAP[@]}; do
+		patched_files=($(util::parse_map_elements \
+						 "${G_FILE_SEP}" "${G_OBJ_PATCHED_MAP[${obj_name}]}"))
+		printf "${obj_name}:"
+		for i in "${patched_files[@]}"; do
+			printf " ${i}.c"
+		done
+		echo ""
+	done >| "${G_TMP_DIR}/${G_OBJ_PATCHED_MAP_FILE}"
+}
+
+# takes a set of llvm filenames and invokes the kbuild build target,
+# dir/file.ll. Once the llvm target is built, it adds a given filename
+# suffix to the llvm files..
+function generate_llvm_ir_files()
+{
+	local -r FILE_SUFFIX="${1}"
+	shift
+	local -ra llvm_files=("$@")
+
+	if [[ ${G_IS_SLOW_PATH} == true ]]; then
+		util::log_info "Taking slow path to build LLVM IR files"
+	fi
+
+	# to compile LLVM IR file, name for aligned file should be $kdir/$file
+	# with no suffix.
+	local i=""
+	for i in "${llvm_files[@]}"; do
+		local in_file_no_ext="${i%.*}"
+		if [[ ${G_IS_SLOW_PATH} == false ]]; then
+			local i="${i%.*}"
+			cp -f \
+			   "${G_TMP_DIR}/${in_file_no_ext}${FILE_SUFFIX}.c${G_SUFFIX_ALIGNED}" \
+			   "${G_TMP_DIR}/${in_file_no_ext}.c"
+		else
+			# TODO: support slow path using kbuild
+			:
+		fi
+	done
+
+	local i=""
+	for i in "${llvm_files[@]}"; do
+		if [[ ${G_IS_SLOW_PATH} == false ]]; then
+			local in_file_no_ext="${i%.*}"
+			local cmd_file="$(cmd_file_path "${in_file_no_ext}.o")"
+			local out_file="${G_TMP_DIR}/${in_file_no_ext}${FILE_SUFFIX}.ll"
+			run_command "${G_LIVEPATCH_COMPILE}" --cmd_file="${cmd_file}" \
+				  --output="${out_file}" "${G_TMP_DIR}/${in_file_no_ext}.c"
+			# "${G_TMP_DIR}/${in_file_no_ext}.c" is temporary. so remove it.
+			rm -f "${G_TMP_DIR}/${in_file_no_ext}.c"
+		else
+			# TODO: call to kbuild should be defined as constant var
+			make LIVEPATCH_COMPILE="${G_LIVEPATCH_CC}" \
+				   LIVEPATCH_COMPILE_PARAMS="build_ll_file" \
+				   "${i}"
+			# rename the IR files with a given suffix
+			local patched_file="${i%.ll}${FILE_SUFFIX}"
+			mv -f "${i}" "${patched_file}"
+			printf "\t${patched_file}\n"
+		fi
+	done
+	util::log_ok "Done building LLVM IR files"
+}
+
+# aligns 'original' and 'patched' to avoid unnecessary diffs due to possible __LINE__
+# macros in 'patched'. empty lines are added to 'original' and 'patched' based on the
+# .patch file.
+function align_files()
+{
+	local -ra PATCHED_FILES=("$@")
+
+	util::log_info "Aligning files before diffing"
+
+	# copy original files under ${G_TMP_DIR}
+	local __file=""
+	for __file in ${PATCHED_FILES[@]}; do
+		mkdir -p $(dirname "${G_TMP_DIR}/${__file}")
+		cp -f "${__file}.c" "${G_TMP_DIR}/${__file}${G_SUFFIX_ORIGINAL}.c"
+	done
+
+	util::log_info "Applying a patch, $(basename "${G_PATCH_FILE}")"
+	patch -N -p1 -d "${G_KDIR}" -i "${G_PATCH_FILE}"
+	G_PATCHED_DIRTY=1
+	util::log_ok "Patch is applied"
+
+	# copy patched files under ${G_TMP_DIR}
+	for __file in ${PATCHED_FILES[@]}; do
+		cp -f "${__file}.c" "${G_TMP_DIR}/${__file}${G_SUFFIX_PATCHED}.c"
+	done
+
+	util::log_info "Removing the patch"
+	patch -R -p1 -d "${G_KDIR}" -i "${G_PATCH_FILE}"
+	G_PATCHED_DIRTY=0
+	util::log_ok "Patch is removed"
+
+	for __file in ${PATCHED_FILES[@]}; do
+		printf "\tAligning ${__file}${G_SUFFIX_ORIGINAL}.c with ${__file}${G_SUFFIX_PATCHED}.c\n"
+		run_command "${G_LIVEPATCH_BIN}" align --patch="${G_PATCH_FILE}" \
+			 --suffix="${G_SUFFIX_ALIGNED}" --diffed_file="${__file}.c" \
+			 "${G_TMP_DIR}/${__file}${G_SUFFIX_ORIGINAL}.c" \
+			 "${G_TMP_DIR}/${__file}${G_SUFFIX_PATCHED}.c"
+	done
+
+	util::log_ok "Aligning is done"
+}
+
+function get_thin_archive_name()
+{
+	local -r __OBJ_PARENT="${1}"
+
+	local __thin_archive=""
+	if [[ "${__OBJ_PARENT}" == "${G_KERNEL_VMLINUX}" ]]; then
+		# for vmlinux, thin_archive is expected to sit under the same directory where the
+		# ${G_KERNEL_VMLINUX} lives. if the archive doesn't exist, this function returns
+		# empty option.
+		__thin_archive="${G_KDIR}/${G_KERNEL_VMLINUX}.a"
+	else
+		# for kernel module, thin_archive is expected to sit under the same
+		# directory where the kernel module lives. if the archive doesn't exist,
+		# this function returns empty option.
+		local -r __MOD_NAME="$(basename "${__OBJ_PARENT}")"
+		__thin_archive="${G_KDIR}/$(dirname "${__OBJ_PARENT}")/${__MOD_NAME%.ko}.a"
+	fi
+
+	echo "${__thin_archive}"
+}
+
+# generates text file for thin archive for vmlinux or kernel module depending on
+# ${__OBJ_PARENT}". If the text file is already available (meaning ${G_THIN_ARCHIVE} is
+# already set), this simply returns. If the text doesn't exist, this function generates
+# the text file and set ${G_THIN_ARCHIVE}
+function generate_thin_archive_txt()
+{
+	local -r __OBJ_PARENT="${1}"
+	local -r __RETVAL="${2}"
+
+	local -r __THIN_ARCHIVE=$(get_thin_archive_name "${__OBJ_PARENT}")
+	if [[ ! -f "${__THIN_ARCHIVE}" ]]; then
+		return 0
+	fi
+
+	local -r __THIN_ARCHIVE_TXT="${G_TMP_DIR}/$(basename "${__thin_archive}").thin"
+	if [[ -f ${__THIN_ARCHIVE_TXT} ]]; then
+		return 0
+	fi
+
+	util::log_info "Generating text file for thin archives"
+	cp "${__THIN_ARCHIVE}" "${G_TMP_DIR}"
+	run_command "${G_NM_CMD}" -f posix --defined-only "${__THIN_ARCHIVE}" >| \
+		"${__THIN_ARCHIVE_TXT}"
+	run_command sed -i -e "s|${G_KDIR}/||g" "${__THIN_ARCHIVE_TXT}"
+
+	eval "${__RETVAL}"="${__THIN_ARCHIVE_TXT}"
+	util::log_ok "Text file, "${__THIN_ARCHIVE}", for thin archive is generated"
+	return 0
+}
+
+# takes a parameter, "name" of variable, and returns thin_archive option to the
+# parameter for livepatch (diff|fixup) command.
+#
+# NOTE: this function puts prefix, __, to its local variables to avoid
+# naming collision with the name for return value.
+function get_thin_archive_opt()
+{
+	local -r __OBJ_PARENT="${1}"
+	local -r __RETVAL="${2}"
+
+	local __thin_archive=""
+	generate_thin_archive_txt "${__OBJ_PARENT}" "__thin_archive"
+	if [[ -n  "${__thin_archive}" ]]; then
+		util::log_info "Thin archive: $(basename ${__thin_archive})"
+		eval "${__RETVAL}"="--thin_archive=${__thin_archive}"
+	else
+		util::log_warn "thin archive for ${__OBJ_PARENT} doesn't exist"
+		eval "${__RETVAL}"=""
+	fi
+
+	return 0
+}
+
+# generates LLVM IR files for the 'original' and the 'patched' that are in
+# PATCHED_FILES array. Then, calls `livepatch` to compute diffs between
+# them. This outputs a set of LLVM IR files, ${file}__klp_diff.ll that
+# distills the diffs.
+function compute_diff()
+{
+	local -ra PATCHED_FILES=("$@")
+
+	local -a llvm_files=()
+	for patched_file in ${PATCHED_FILES[@]}; do
+		llvm_files+=("${patched_file}.ll")
+	done
+
+	util::log_info "Building LLVM IR files for the 'original'"
+	generate_llvm_ir_files "${G_SUFFIX_ORIGINAL}" "${llvm_files[@]}"
+
+	util::log_info "Building LLVM IR files for the 'patched'"
+	# Note: even though original.c && patched.c are copied by aligning, we
+	# still need "patched" header files to compile patched.c files
+	util::log_info "Applying a patch, $(basename "${G_PATCH_FILE}")"
+	run_command patch -N -p1 -d "${G_KDIR}" -i "${G_PATCH_FILE}"
+	G_PATCHED_DIRTY=1
+	util::log_ok "Patch is applied"
+
+	generate_llvm_ir_files "${G_SUFFIX_PATCHED}" "${llvm_files[@]}"
+
+	util::log_info "Removing the patch"
+	run_command patch -R -p1 -d "${G_KDIR}" -i "${G_PATCH_FILE}"
+	G_PATCHED_DIRTY=0
+	util::log_ok "Patch is removed"
+
+	util::log_info "Computing diffs between 'original' and 'patched'"
+	for patched_file in ${PATCHED_FILES[@]}; do
+		local original_file="${patched_file}${G_SUFFIX_LLVM_IR_ORIGINAL}"
+		local patched_file="${patched_file}${G_SUFFIX_LLVM_IR_PATCHED}"
+
+		printf "\t diffing: ${original_file} ${patched_file}\n"
+
+		# command.h::Command::ErrorCode::NOTHING_TO_PATCH = 7. if .c file
+		# includes header file changed by patch, it would not have any
+		# changes.
+		run_command "${G_LIVEPATCH_BIN}" diff -q --base_dir="${G_TMP_DIR}" \
+			"${G_TMP_DIR}/${original_file}" "${G_TMP_DIR}/${patched_file}" || \
+			test $? == 7
+		printf "\t diffed: ${original_file} and ${patched_file}\n"
+	done
+	util::log_ok "Computing diffs is done"
+}
+
+function get_klp_obj_root()
+{
+	local -r OBJ_PARENT="${1}"
+	local -r __KLP_OBJ_ROOT="${G_TMP_DIR}/$(basename "${OBJ_PARENT}")"
+	mkdir -p "${__KLP_OBJ_ROOT}"
+	echo "${__KLP_OBJ_ROOT}"
+}
+
+# assuming that `compute_diff` generated "${file}__klp_diff.ll", this function compiles
+# and combines them to generate "${G_KLP_PATCH_OBJ}". The generated "${G_KLP_PATCH_OBJ}"
+# will be linked to a livepatch wrapper to create a kernel livepatch.
+function compile_diff()
+{
+	local -r OBJ_PARENT="${1}"
+	shift
+	local -ra PATCHED_FILES=("$@")
+
+	local -a obj_files=()
+	local i=""
+	for i in ${PATCHED_FILES[@]}; do
+		# note that PATCHED_FILES has a filename without extension
+		obj_files+=("${i}.o")
+	done
+
+	util::log_info "Building LLVM IR diff files"
+	if [[ ${G_IS_SLOW_PATH} == true ]]; then
+		util::log_info "Taking slow path for build"
+	fi
+
+	# even though kbuild thinks that .o files are built, CC command is intercepted by
+	# ${G_LIVEPATCH_CC}. ${G_LIVEPATCH_CC} replaces ${file}.c with ${file}__klp_diff.ll to
+	# compile the diff files. So, after this command, a set of
+	# ${file}${G_SUFFIX_KLP_DIFF}.o are expected.
+	local -a diff_obj_files=()
+	for i in "${obj_files[@]}"; do
+		local in_file_no_ext="${i%.*}"
+		local ll_file="${G_TMP_DIR}/${in_file_no_ext}${G_SUFFIX_KLP_DIFF}.ll"
+		local cmd_file="$(cmd_file_path "${i}")"
+		local out_file="${G_TMP_DIR}/${in_file_no_ext}${G_SUFFIX_KLP_DIFF}.o"
+		if [[ -f "${ll_file}" ]]; then
+			diff_obj_files+=("${out_file}")
+		else
+			continue
+		fi
+		if [[ ${G_IS_SLOW_PATH} == false ]]; then
+			rm -f "${out_file}"
+			run_command "${G_LIVEPATCH_COMPILE}" --cmd_file="${cmd_file}" \
+				  --output="${out_file}" "${ll_file}"
+		else
+			# TODO: call to kbuild should be defined as constant var
+			make LIVEPATCH_COMPILE="${G_LIVEPATCH_CC}" \
+				   LIVEPATCH_COMPILE_PARAMS="build_distilled_file" \
+				   "${i}"
+		fi
+	done
+	util::log_ok "Done building LLVM IR diff files"
+
+	# if no files are changed, skip building ${G_KLP_PATCH_OBJ}
+	if [[ "${#diff_obj_files[@]}" == 0 ]]; then
+		util::log_info "No changes for ${OBJ_PARENT}. Skip generating ${G_KLP_PATCH_OBJ}"
+		return 0
+	fi
+
+	# combine all ${file}__klp_diff.o and generate "${G_KLP_PATCH_OBJ}"
+	local -r KLP_OBJ_ROOT="$(get_klp_obj_root "${OBJ_PARENT}")"
+	run_command "${G_LD_CMD}" -r -o "${KLP_OBJ_ROOT}/${G_KLP_PATCH_OBJ}" "${diff_obj_files[@]}"
+
+	util::log_info "fixing up ${G_KLP_PATCH_OBJ} for livepatched symbols"
+	# before fixing up, make a backup
+	cp -f "${KLP_OBJ_ROOT}/${G_KLP_PATCH_OBJ}" "${KLP_OBJ_ROOT}/${G_KLP_PATCH_OBJ}.bak"
+
+	local thin_archive_opt=""
+	get_thin_archive_opt "${OBJ_PARENT}" "thin_archive_opt"
+	if [[ "${OBJ_PARENT}" == "${G_KERNEL_VMLINUX}" ]]; then
+		run_command "${G_LIVEPATCH_BIN}" fixup -q ${thin_archive_opt} \
+			"${KLP_OBJ_ROOT}/${G_KLP_PATCH_OBJ}"
+	else
+		run_command "${G_LIVEPATCH_BIN}" fixup -q --mod="${OBJ_PARENT}" \
+			${thin_archive_opt} "${KLP_OBJ_ROOT}/${G_KLP_PATCH_OBJ}"
+	fi
+
+	util::log_ok "${G_KLP_PATCH_OBJ} is built"
+}
+
+function generate_buildinfo()
+{
+	local -r FILENAME="${1}"
+	{
+		printf "Arch: ${G_BUILD_ARCH}\n"
+		printf "Cmdline: ${G_LIVEPATCH_CMDLINE}\n"
+		printf "CommitId: $(git log -n1 --format="%H" HEAD)\n"
+		printf "TreeId: $(git ls-tree HEAD scripts | awk '{print $3}')\n"
+		printf "Linux version: " ; strings "${G_KDIR}/init/version.o" | \
+			awk '/^Linux version/ { print $0 }'
+		printf "Describe: $(git describe --always --abbrev=12 --dirty 2>/dev/null)\n"
+		printf "Username: $(whoami)\n"
+		printf "Hostname: $(hostname)\n"
+		printf "Path: ${G_KDIR}\n"
+		printf "ScriptVersion: ${G_SCRIPT_VERSION}\n"
+	} >| "${FILENAME}"
+	util::log_info "Printing build info"
+	cat "${FILENAME}"
+	return 0
+}
+
+function get_buildinfo
+{
+	local -r OBJ_PARENT="${1}"
+	local -r KLP_OBJ_ROOT="$(get_klp_obj_root "${OBJ_PARENT}")"
+	echo "${KLP_OBJ_ROOT}/buildinfo"
+}
+
+# generates livepatch wrapper, linker script, and Makefile for kernel
+# livepatch. the wrapper is linked to ${G_KLP_PATCH_OBJ} with the linker
+# script. At the end of this function, it calls kbuild to build kernel
+# livepatch.
+function generate_klp()
+{
+	local -r OBJ_PARENT="${1}"
+	local klp_mod_name="$(util::get_livepatch_ko_name "${G_PATCH_FILE}")"
+
+	local klp_mod_opt=""
+	local thin_archive_opt=""
+	if [[ "${OBJ_PARENT}" != "${G_KERNEL_VMLINUX}" ]]; then
+		klp_mod_opt="--mod=${OBJ_PARENT}"
+		get_thin_archive_opt "${OBJ_PARENT}" "thin_archive_opt"
+	fi
+
+	local -r KLP_OBJ_ROOT="$(get_klp_obj_root "${OBJ_PARENT}")"
+	local -r KLP_PATCH_OBJ="${KLP_OBJ_ROOT}/${G_KLP_PATCH_OBJ}"
+	if [[ ! -f "${KLP_PATCH_OBJ}" ]]; then
+		echo "No changes for ${OBJ_PARENT}" >| "${KLP_OBJ_ROOT}/${G_EMPTY_LIVEPATCH}"
+		util::log_info "No ${KLP_PATCH_OBJ} for ${OBJ_PARENT}. Skip generating wrapper"
+		return 0
+	fi
+
+	util::log_info "Generating wrapper, linker script, and Makefile"
+	run_command "${G_LIVEPATCH_BIN}" gen --kdir="${G_KDIR}" --odir="${KLP_OBJ_ROOT}" \
+			${klp_mod_opt} ${thin_archive_opt} \
+			--name="${klp_mod_name%.ko}" \
+			"${KLP_PATCH_OBJ}"
+
+	util::log_ok "Wrapper, linker script, and Makefile are generated"
+
+	# enforce suffix for patch file to be $G_UTIL_SUFFIX_PATCH for llpatch-multi
+	local patch_file="$(basename ${G_PATCH_FILE})"
+	patch_file="${patch_file%.*}.${G_UTIL_SUFFIX_PATCH}"
+	cp -f "${G_PATCH_FILE}" "${KLP_OBJ_ROOT}/${patch_file}"
+	generate_buildinfo "$(get_buildinfo "${OBJ_PARENT}")"
+}
+
+# Generate kernel livepatch
+function livepatch_ko_build()
+{
+	local -r OBJ_PARENT=${1}
+	shift
+	local -ra PATCHED_FILES=("$@")
+
+	util::log_info "Start generating kernel livepatch."
+
+	# Step 0: align 'original' and 'patched'. Due to the changes by .patch, __LINE__ in
+	# 'patched' can be affected, which results in unnecessary diffs creating fatty
+	# livepatch. To avoid this, empty lines are added to 'original' and 'patched' before
+	# diffing.
+	align_files "${PATCHED_FILES[@]}"
+
+	# Step 1: generate LLVM IR files and compute the diffs between the
+	# 'orignal' and the 'patched'. This function creats a set of LLVM IR
+	# files, ${file}__klp_diff.ll that distills the diffs.
+	compute_diff "${PATCHED_FILES[@]}"
+
+	# Step 2: compile the LLVM IR files distilling the diffs and generate
+	# ${G_KLP_PATCH_OBJ} that combines the compiled IR files.
+	compile_diff "${OBJ_PARENT}" "${PATCHED_FILES[@]}"
+
+	# Step 3: With ${G_KLP_PATCH_OBJ}, generate kernel livepatch.
+	generate_klp "${OBJ_PARENT}"
+
+	util::log_ok "Livepatch is ready to be packaged."
+	return 0
+}
+
+# Build a package for livepatch, a tarball by calling 'create-package'.
+# This function assumes that `cwd` is ${kdir}.
+function package_build()
+{
+	local -r OBJ_PARENT="${1}"
+	local -r KLP_OBJ_ROOT="$(get_klp_obj_root "${OBJ_PARENT}")"
+
+	util::log_info "Building kernel livepatch"
+	# for now, use kbuild for arm64.
+	if [[ ${G_BUILD_ARCH} == "arm64" ]]; then
+		make ARCH=arm64 M="${KLP_OBJ_ROOT}"
+	else
+		# "-C ${KLP_OBJ_ROOT}" for make doesn't work for kernel module build here
+		pushd "${KLP_OBJ_ROOT}" >& /dev/null
+		"${MAKE:-make}" CLANG=1 LLVM=1
+		popd  >& /dev/null
+	fi
+	util::log_ok "Livepatch is built"
+
+	# before creating KLP rela section, make a backup
+	local -r KLP_MOD_NAME="$(util::get_livepatch_ko_name "${G_PATCH_FILE}")"
+	local klp_mod_opt=""
+	if [[ "${OBJ_PARENT}" != "${G_KERNEL_VMLINUX}" ]]; then
+		klp_mod_opt="--mod=${OBJ_PARENT}"
+	fi
+
+	util::log_info "Creating KLP rela section"
+	cp -f "${KLP_OBJ_ROOT}/${KLP_MOD_NAME}" "${KLP_OBJ_ROOT}/${KLP_MOD_NAME}.bak"
+	run_command "${G_LIVEPATCH_BIN}" fixup -q --rela ${klp_mod_opt} \
+			"${KLP_OBJ_ROOT}/${KLP_MOD_NAME}"
+	util::log_ok "Rela section is created"
+
+	local -r BUILDINFO="$(get_buildinfo "${OBJ_PARENT}")"
+	local -r KERNEL_RELEASE="$(strings "init/version.o" | awk '/^Linux version/ { print $3 }')"
+	local -r KLP_FILE="${KLP_OBJ_ROOT}/$(util::get_livepatch_ko_name "${G_PATCH_FILE}")"
+	local -r PACKAGE_BASENAME="${KERNEL_RELEASE}.${G_BUILD_ARCH}"
+	local -r PKG_TARBALL="${G_ODIR}/kernelpatch-$(util::get_livepatch_name "${G_PATCH_FILE}")-${PACKAGE_BASENAME}.msvp.tar.xz"
+
+	mkdir -p "${G_ODIR}"
+	run_command "${G_CREATE_PACKAGE}" "${KLP_FILE}" \
+		  --buildinfo "${BUILDINFO}" \
+		  --patch "${G_PATCH_FILE}" \
+		  --output "${PKG_TARBALL}" \
+		  --debug-dir "${G_TMP_DIR}"
+}
+
+function generate_livepatch_package
+{
+	# get list of patched kernel modules and/or vmlinux. note that some
+	# patched objects would not changed due to header file changes.
+	local -a patched_objs=()
+	for obj_parent in ${!G_OBJ_PATCHED_MAP[@]}; do
+		if [[ -f "$(get_klp_obj_root "${obj_parent}")/${G_EMPTY_LIVEPATCH}" ]]; then
+			continue
+		fi
+		patched_objs+=("${obj_parent}")
+	done
+
+	[[ "${#patched_objs[@]}" == 0 ]] &&
+		util::error "Nothing changes. Hence no kernel livepatch"
+
+	if [[ ${G_SKIP_PKG_BUILD} == true ]]; then
+		# cleanup will put generated files under ${G_ODIR}
+		G_DEBUG_DIR="${G_ODIR}"
+		return 0
+	fi
+
+	# only single module|vmlinux is changed.
+	if [[ "${#patched_objs[@]}" == 1 ]]; then
+		package_build "${patched_objs[0]}"
+		return 0
+	fi
+
+	local -a patched_roots=()
+	for patch_obj in ${patched_objs[@]}; do
+		patched_roots+=("$(get_klp_obj_root "${patch_obj}")")
+	done
+
+	local dbg_dir_option=""
+	if [[ -n "${G_DEBUG_DIR}" ]]; then
+		dbg_dir_option="--debug-dir=${G_TMP_MERGE_DIR}"
+		# llpatch-merge assumes that ${G_TMP_MERGE_DIR}" should not exist
+		rm -fr "${G_TMP_MERGE_DIR}"
+	fi
+
+	run_command "${G_LIVEPATCH_MERGE}" \
+		--arch="${G_BUILD_ARCH}" \
+		--kdir="${G_KDIR}" \
+		--odir="${G_ODIR}" \
+		"${dbg_dir_option}" \
+		--name="$(util::get_livepatch_name "${G_PATCH_FILE}")" \
+		"${patched_roots[@]}"
+
+	if [[ -n "${G_DEBUG_DIR}" ]]; then
+		# if ${G_DEBUG_DIR} is specified, cleanup() will mv ${G_TMP_DIR} to
+		# ${G_DEBUG_DIR}
+		cp -r "${G_TMP_MERGE_DIR}"/* "${G_TMP_DIR}"
+	fi
+
+	return 0
+}
+
+#-------------------------------------------------------------
+# Main starts here
+#-------------------------------------------------------------
+# before doing anything create a log file first
+> "${G_CMD_LOG_FILE}"
+
+parse_options "$@"
+
+validate_prepare
+
+# this fills out a global array, G_PATCHED_FILES
+generate_patched_file_list
+
+# this sets G_OBJ_PATCHED_MAP
+find_obj_patched_map "${G_PATCHED_FILES[@]}"
+# using G_OBJ_PATCHED_MAP, it dumps the map
+dump_obj_patched_map
+
+if [[ ${G_MULTI_CHANGE} == false ]]; then
+	[[ ${#G_OBJ_PATCHED_MAP[@]} == 1 ]] || \
+		util::error "Changes in multiple kmods and/or vmlinux. --multi option?"
+fi
+
+declare obj_parent=""
+declare -a patched_files=()
+for obj_parent in ${!G_OBJ_PATCHED_MAP[@]}; do
+	util::log_info "Building Livepatch for $(basename "${obj_parent}")"
+	patched_files=($(util::parse_map_elements \
+						 "${G_FILE_SEP}" "${G_OBJ_PATCHED_MAP[${obj_parent}]}"))
+	livepatch_ko_build "${obj_parent}" "${patched_files[@]}"
+done
+
+# using G_OBJ_PATCHED_MAP, generate package for kernel livepatch
+generate_livepatch_package
+
+exit 0

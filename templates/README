@@ -1,0 +1,15 @@
+This directory contains template files used to generate kernel
+livepatch. There are three files under this directory.
+
+1) livepatch.c.tmpl
+   - livepatch wrapper linked to klp_patch.o file that contains
+     implementation of livepatched functions.
+
+2) livepatch.lds.tmpl
+   - linker script that resolves address for the livepatced function.
+
+3) Makefile.tmpl
+   - makefile to build kernel livepatch.
+
+Each template contains {{MARKER}} in it hoping that they are replaced by
+either `llpatch` or `livepatch gen` command.

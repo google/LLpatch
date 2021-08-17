@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+#
+# Copyright 2021 Google LLC
+# 
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+# 
+#     https://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Author: yonghyun@google.com (Yonghyun Hwang)
+#
+# This script intercepts CC command for kbuild's dir/file.o targets to compiles a LLVM IR
+# FILE. For the dir/file.o target, it replaces .c file with a LLVM IR file that distills
+# diffs between 'original' and 'patched'. This task is required to compile the IR file
+# with the same compilation flags as .c file.
+
+#-------------------------------------------------------------
+# Shell setting
+#-------------------------------------------------------------
+set -E
+
+#-------------------------------------------------------------
+# Global variables
+#-------------------------------------------------------------
+declare -r G_KLP_DIFF_SUFFIX='__klp_diff.ll'
+declare -r G_KLP_OBJ_SUFFIX='__klp_diff.o'
+
+#-------------------------------------------------------------
+# Function definitions
+#-------------------------------------------------------------
+function util::log_error()
+{
+	echo "${G_LOG_HEADER}[ERR |$(date +'%m/%d %H:%M')]:: $@" >&2
+	return 0
+}
+
+function util::error()
+{
+	util::log_error "$@"
+	return 1
+}
+
+function util::cleanup()
+{
+	local errCode="${1:-}"
+	local lineNum="${2:-}"
+
+	[[ ${errCode} == 0 ]] || \
+		util::log_error "trap at line: ${lineNum}, with error:${errCode}."
+
+	exit "${errCode}"
+}
+# enable exit trap for debugging purpose
+trap 'util::cleanup $? ${LINENO}' ERR INT TERM EXIT
+
+#-------------------------------------------------------------
+# Main starts here
+#-------------------------------------------------------------
+declare -r CC_CMD="${1}"
+shift
+declare -ar ORIG_ARGS=("$@")
+
+if [[ -z "${LIVEPATCH_COMPILE_PARAMS}" ]]; then
+	# empty ${LIVEPATCH_COMPILE_PARAMS} means livepatch-cc is expected to
+	# pass through a command.
+	exec "${CC_CMD}" "${ORIG_ARGS[@]}"
+fi
+
+# .ll file is used to compute diff between original and patched. "-g" option makes clang
+# to generate calls to llvm.dbg.*. This results in unnecessary diffs between the original
+# and patched. So, removing "-g" options here.
+if [[ "${LIVEPATCH_COMPILE_PARAMS}" == "build_ll_file" ]]; then
+	declare -a args=()
+	while [ "$#" -gt 0 ]; do
+		if [[ "${1}" != "-g" ]]; then
+			args+=("${1}")
+		fi
+		shift
+	done
+	exec "${CC_CMD}" "${args[@]}"
+fi
+
+# for now, ${LIVEPATCH_COMPILE_PARAMS} == "build_distilled_file" means livepatch-cc is
+# expected to compile a LLVM IR file. At this point, kbuild thinks that it builds .c
+# file. So, livepatch-cc replaces .c file w/ LLVM IR file that distills the diffs for
+# kernel livepatch generation.
+declare -a args=()
+declare llvm_diff_file=""
+while [ "$#" -gt 0 ]; do
+	if [[ -f "${1}" ]]; then
+		[[ -z "${llvm_diff_file}" ]] || \
+			util::error "cannot have two .c files on a single command"
+
+		if [[ -f "${1}${G_KLP_DIFF_SUFFIX}" ]]; then
+			# now, located .c file. replace it w/ LLVM IR file. note that
+			# this LLVM IR file should be already created by `livepatch
+			# diff` command.
+			llvm_diff_file="${1}"
+			args+=("${llvm_diff_file}${G_KLP_DIFF_SUFFIX}")
+		else
+			args+=("${1}")
+		fi
+	else
+		args+=("${1}")
+	fi
+	shift
+done
+
+if [[ -z "${llvm_diff_file}" ]]; then
+	# kbuild builds other files due to a dependancy. pass through a command.
+	exec "${CC_CMD}" "${ORIG_ARGS[@]}"
+fi
+
+# because kbuild expects outputs, such as dir/file.d, for dir/file.o target,
+# run an original command first.
+"${CC_CMD}" "${ORIG_ARGS[@]}"
+# note that the last -o option is picked up by compiler for output
+# filename.
+args+=("-o" "${llvm_diff_file}${G_KLP_OBJ_SUFFIX}")
+exec "${CC_CMD}" "${args[@]}"
