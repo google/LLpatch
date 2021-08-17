@@ -67,16 +67,16 @@ trap 'cleanup $? ${LINENO}' ERR INT TERM EXIT
 function print_usage()
 {
 	cat <<EOF
-Usage: ${G_KLP_COMPILE_CMD} [OPTIONS] [FILE]
+Usage: $(basename ${G_KLP_COMPILE_CMD}) [OPTIONS] [FILE]
 Compile a [FILE], .ll (or .c), to .o (or .ll) file
 
 File: LLVM IR file or c file
 
 Options:
-  -c, --cmd_file Path to cmd_file, \$kdir/.file.o.cmd.
-                 Build command and options in this file are used.
-  -h, --help     This help message.
-  -o, --output   Path to an output file.
+  -c, --cmd_file=FILE  Path to cmd_file, \$kdir/.file.o.cmd.
+                       Build command and options in this file are used.
+  -o, --output=PATH    Path to an output file.
+  -h, --help           This help message.
 EOF
 	return 0
 }

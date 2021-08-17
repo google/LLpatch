@@ -70,19 +70,19 @@ trap 'cleanup $? ${LINENO}' ERR INT TERM EXIT
 function print_usage()
 {
 	cat <<EOF
-Usage: ${G_CREATE_PACKAGE_CMD} [OPTIONS] [FILE]
+Usage: $(basename ${G_CREATE_PACKAGE_CMD}) [OPTIONS] [FILE]
 Build a tarball, package for kernel livepatch.
 
 File: .ko file, kernel module, for kernel livepatch
 
 Options:
-  -b, --buildinfo   Path to a buildinfo file
-  -h, --help   This help message.
-  -o, --output  Path to a tarball for kernel livepatch package
-  -p, --patch   Path to a patch file
+  -b, --buildinfo=PATH   Path to a buildinfo file
+  -o, --output=PATH      Path to a tarball for kernel livepatch package
+  -p, --patch=FILE       Path to a patch file
+  -h, --help             This help message.
 
-Developer Options:	(for internal testing, not production use)
-  --debug-dir		Dir for debugging with all intermediate files for klp generation
+Developer Options: (for internal testing, not production use)
+  --debug-dir=PATH   Dir for debugging with all intermediate files for klp generation
 EOF
 	return 0
 }

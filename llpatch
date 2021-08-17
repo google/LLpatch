@@ -519,9 +519,9 @@ function dump_obj_patched_map()
 	done >| "${G_TMP_DIR}/${G_OBJ_PATCHED_MAP_FILE}"
 }
 
-# takes a set of llvm filenames and invokes the kbuild build target,
-# dir/file.ll. Once the llvm target is built, it adds a given filename
-# suffix to the llvm files..
+# takes a set of LLVM filenames and invokes the kbuild build target,
+# dir/file.ll. Once the LLVM target is built, it adds a given filename
+# suffix to the LLVM files..
 function generate_llvm_ir_files()
 {
 	local -r FILE_SUFFIX="${1}"
@@ -532,7 +532,7 @@ function generate_llvm_ir_files()
 		util::log_info "Taking slow path to build LLVM IR files"
 	fi
 
-	# to compile LLVM IR file, name for aligned file should be $kdir/$file
+	# To compile LLVM IR file, name for aligned file should be $kdir/$file
 	# with no suffix.
 	local i=""
 	for i in "${llvm_files[@]}"; do
