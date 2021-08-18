@@ -280,9 +280,15 @@ std::error_code FixupCommand::RenameKlpSymbols(ElfBin *elf_bin,
 			//      is 0.
 			unsigned pos = 0;
 			if (tar) {
-				pos = tar->QuerySymbol(
-					RealSymName.str(),
-					SrcFile.rsplit('.').first.str() + ".o");
+				const auto& symbol = RealSymName.str();
+				const auto& filename = SrcFile.rsplit('.').first.str() + ".o";
+					pos = tar->QuerySymbol(symbol, filename);
+				if (pos < 0) {
+					errs() << "Symbol: " << symbol
+						<< ", Filename: " << filename << "\n"
+						<< "Fail to find the symbol in thin archive\n";
+					return Command::ErrorCode::SYM_FIND_FAILED;
+				}
 			}
 
 			const std::string kKlpSymName =

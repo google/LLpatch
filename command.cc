@@ -63,6 +63,9 @@ std::string CommandErrorCategory::message(int ev) const
 	case Command::ErrorCode::NOTHING_TO_PATCH:
 		msg = "nothing to patch";
 		break;
+	case Command::ErrorCode::SYM_FIND_FAILED:
+		msg = "symbol not found in thin archive";
+		break;
 	default:
 		msg = "unrecognized error";
 		break;

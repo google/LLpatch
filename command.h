@@ -38,6 +38,7 @@ struct Command {
 		FILE_OPEN_FAILED = 5,
 		INVALID_PATCH_FILE = 6,
 		NOTHING_TO_PATCH = 7,
+		SYM_FIND_FAILED = 8,
 	};
 
 	virtual ~Command() = default;

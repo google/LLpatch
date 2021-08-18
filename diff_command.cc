@@ -244,6 +244,12 @@ std::error_code DistillDiffFunctions(DiffConsumer *consumer, Module *original,
 			// 'original'. Convert it to an extern function by deleting a
 			// function body.
 			RFn.deleteBody();
+
+			if (RFn.isDSOLocal()) {
+				RFn.setName(ElfSymbol::CreateLivepatchedSymbolName(
+					RFn.getName(), original->getSourceFileName(),
+					base_path));
+			}
 		}
 	}
 
