@@ -649,8 +649,9 @@ function generate_thin_archive_txt()
 		return 0
 	fi
 
-	local -r __THIN_ARCHIVE_TXT="${G_TMP_DIR}/$(basename "${__thin_archive}").thin"
+	local -r __THIN_ARCHIVE_TXT="${G_TMP_DIR}/$(basename "${__THIN_ARCHIVE}").thin"
 	if [[ -f ${__THIN_ARCHIVE_TXT} ]]; then
+		eval "${__RETVAL}"="${__THIN_ARCHIVE_TXT}"
 		return 0
 	fi
 
