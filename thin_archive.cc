@@ -17,16 +17,41 @@
  */
 #include "thin_archive.h"
 
+#include <cctype>
 #include <fstream>
 #include <regex>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <unordered_set>
+#include <utility>
 
 #include "auto_cleanup.h"
 #include "elf_error.h"
 #include "llvm/Support/raw_ostream.h"
+
+namespace
+{
+// Parses a given line assuming that line complies w/ posix output by nm.
+// Note that returned symbol type is always 'W' if it's weak symbol or object.
+std::pair</*symbol name*/std::string, /*symbol type*/char>
+ParseSymbolLine(const std::string& line)
+{
+	size_t sym_end = line.find(' ');
+	std::string symbol_name = line.substr(0, sym_end);
+
+	char symbol_type = '?';
+	if (sym_end != std::string::npos) {
+		size_t sym_type_pos = line.find_first_not_of(' ', sym_end);
+		symbol_type = toupper(line.at(sym_type_pos));
+	}
+
+	// V: The symbol is a weak object. W: The symbol is a weak symbol.
+	// We need to know whether symbol is weak or not. So, use 'W' only
+	symbol_type = (symbol_type == 'V') ? 'W' : symbol_type;
+	return std::make_pair(symbol_name, symbol_type);
+}
+} // namespace
 
 std::unique_ptr<ThinArchive> ThinArchive::Create(const std::string &filename)
 {
@@ -47,15 +72,31 @@ ThinArchive::ThinArchive(std::string_view filename) noexcept(false)
 	// Two pass algorithm to build unique_symbols_ and duplicated_symbols_
 	// Step 1: Build unique_symbols_ while finding duplicated symbols.
 	std::unordered_set<std::string> dup_symbols;
+	std::unordered_set<std::string> non_weak_symbols;
 	std::string line;
 	while (getline(file, line)) {
-		std::string symbol_name = line.substr(0, line.find(" "));
+		auto [symbol_name, symbol_type] = ParseSymbolLine(line);
 		if (unique_symbols_.find(symbol_name) ==
 		    unique_symbols_.end()) {
-			unique_symbols_.emplace(std::move(symbol_name));
-		} else {
+			unique_symbols_.emplace(symbol_name);
+
+			if (symbol_type != 'W') {
+				non_weak_symbols.emplace(std::move(symbol_name));
+			}
+			continue;
+		}
+
+		if (symbol_type == 'W') {
+			continue;
+		}
+
+		// If symbol in unique_symbols_ is not weak, it's duplicated symbol.
+		if (non_weak_symbols.find(symbol_name) !=
+			non_weak_symbols.end()) {
 			dup_symbols.emplace(std::move(symbol_name));
 		}
+
+		non_weak_symbols.emplace(std::move(symbol_name));
 	}
 	for (const std::string &i : dup_symbols) {
 		unique_symbols_.erase(i);
@@ -80,27 +121,29 @@ ThinArchive::ThinArchive(std::string_view filename) noexcept(false)
 		}
 
 		symbol_name = line.substr(0, line.find(" "));
-		if (dup_symbols.find(symbol_name) != dup_symbols.end()) {
-			auto sym_file = std::string(symbol_name) +
-					std::string(current_filename);
-			if (same_sym_file.find(sym_file) ==
-			    same_sym_file.end()) {
-				same_sym_file.insert(sym_file);
-			} else {
-				// Oops. this ELF has same symbol+filename combination,
-				// which cannot be handled. :'( throw exception.
-				llvm::outs()
-					<< "sym: " << symbol_name
-					<< ", filename: " << current_filename
-					<< "\n";
-				throw std::error_code{
-					ElfErrorCode::SAME_SYMBOL_FILENAME
-				};
-			}
-
-			duplicated_symbols_[symbol_name].push_back(
-				current_filename);
+		if (unique_symbols_.find(symbol_name) != unique_symbols_.end()) {
+			continue;
 		}
+
+		auto sym_file = std::string(symbol_name) +
+				std::string(current_filename);
+		if (same_sym_file.find(sym_file) ==
+		    same_sym_file.end()) {
+			same_sym_file.insert(sym_file);
+		} else {
+			// Oops. this ELF has same symbol+filename combination,
+			// which cannot be handled. :'( throw exception.
+			llvm::outs()
+				<< "sym: " << symbol_name
+				<< ", filename: " << current_filename
+				<< "\n";
+			throw std::error_code{
+				ElfErrorCode::SAME_SYMBOL_FILENAME
+			};
+		}
+
+		duplicated_symbols_[symbol_name].push_back(
+			current_filename);
 	}
 }
 
