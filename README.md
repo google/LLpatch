@@ -10,6 +10,50 @@ it does not require a whole kernel build with special compiler options,
 which makes livepatch generation much faster while keeping original kernel
 repository unchanged.
 
+Benefits of LLpatch
+-------------------
+
+LLpatch has lots of benefits compared to the existing livepatch generation tools. 
+These are important benefits:
+
+1. **Architecture-Agnostic**: The core algorithm for kernel livepatch generation is to
+   "diff" patched.c against original.c and distill the differences. Rather than a
+   source-level diff, LLpatch uses LLVM IR for diffing to abstract away all the
+   specifics/details on machine architecture, types of linkers, and kernel version.
+
+2. **Slim Livepatch**: LLpatch uses 'llvm-diff' to perform the diffing and generates LLVM IR
+   code that distills the differences. This allows compiler-backend to fully optimize a
+   final ELF binary for kernel livepatch. (e.g., no redundant global variables not used in
+   livepatch.
+
+3. **Better Checking and Validation**: LLVM IR contains much more information than ELF
+   binary. So, it's possible to implement lots of useful checking and validation mechanism
+   for livepatch generation. (e.g., changes in function prototype should not be allowed.)
+
+4. **Semi-Automatic Livepatch Generation and Easy Debugging**
+   + LLpatch respects Unix philasophy, "One command does one task very well." To this end,
+     LLpatch implements small commands (livepatch, llpatch-merge, livepatch-compile,
+     update-patch, ...)  that runs one task very well. `llpatch` puts them together to
+     orchestrate livepatch generation.
+   + LLpatch can stop livepatch generation at any micro steps, allow manual intervention,
+     and resume the generation from where it left. This is essential to use
+     (pre|post)-(patch|unpatch) callbacks and initialize shadow variable if required.
+   + Log every micro steps and their results for livepatch generation. In case that
+     generation doesn't go through smoothly, developer can have enough information for
+     reproducing and debugging the bug.
+
+5. **Ultra-Fast Livepatch Generation and Unchanged Kernel Repository**
+   + LLpatch doesn't require special compiler options for the diffing. So, kernel doesn't
+     need to be re-compiled differently.
+   + Assuming that kernel repository is already built, LLpatch parses .patch file to
+     figure out what files are changed by the .patch file. Compile options are derived
+     from \*.o.cmd files. For a simple livepatch generation, LLpatch takes just few
+     seconds.
+
+6. **Handling Duplicate Symbol Names**
+   + LLpatch makes use of thin archive to resolve duplicate symbol names when generating
+     kernel livepatch. This greatly simplies logic for the symbol handling.
+
 Supported Architectures
 -----------------------
 
