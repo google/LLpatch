@@ -26,6 +26,7 @@ set -E
 #-------------------------------------------------------------
 # Global variables
 #-------------------------------------------------------------
+declare -r G_KERNEL_VMLINUX="vmlinux"
 declare -r G_LOG_HEADER="${1}"
 declare -r G_MESG_COLOR_RED=$(tput setaf 1)
 declare -r G_MESG_COLOR_GREEN=$(tput setaf 2)
@@ -116,4 +117,88 @@ function util::parse_map_elements()
 		fi
 	done
 	echo "${ret_list[@]}"
+}
+
+# convert path to patched file to .*.o.cmd file
+function util::cmd_file_path()
+{
+	local -r FILE_PATH="${1}"
+	echo "$(dirname "${FILE_PATH}")/.$(basename "${FILE_PATH}").cmd"
+}
+
+# do reverse operation of cmd_file_path
+function util::un_cmd_file_path()
+{
+	local -r CMD_PATH="${1}"
+	local CMD_FILE="$(basename "${CMD_PATH}")"
+	CMD_FILE="${CMD_FILE:1}" # remove the prefix '.' in the name
+	CMD_FILE="${CMD_FILE%%\.cmd}" # remove the suffix .o.cmd in the name
+	echo "$(dirname "${CMD_PATH}")/${CMD_FILE}"
+}
+
+# takes two parameter: first: path to file "with" .o extension, second:
+# "name" of variable to return a name for object parent.
+#
+# Assumption: given patched file __does not__ have more than two
+# parents. e.g., obj.o is a part of library used for kmod1.ko, kmod2.ko,
+# ...
+#
+# NOTE: this function puts prefix, __, to its local variables to avoid
+# naming collision with the name for return value.
+function util::__find_obj_parent()
+{
+	# given patched file is its own object parent.
+	local __obj_parent="${1}"
+	local -r __RETVAL="${2}"
+
+	# starting from dir where the given patched file lives, search the dir
+	# and its parent dir.
+	local __parent_dir="$(dirname "${__obj_parent}")"
+	local __cmd_file="$(util::cmd_file_path "${__obj_parent}")"
+	while [[ ! -e "${__parent_dir}/MAINTAINERS" ]]; do
+		util::log_info "Looking at ${__parent_dir} for parent object for ${__cmd_file}"
+
+		# cmd files in parent dir except __cmd_file
+		local -a __cmd_files=($(find "${__parent_dir}" -maxdepth 1 \
+						-name '.*.o.cmd' -a \
+						-not -name $(basename "${__cmd_file}")))
+		# now following .*.o.cmd file in ${__cmd_files[@]} to find object
+		# parent.
+		while [[ ${#__cmd_files[@]} != 0 ]]; do
+			local __un_cmd_file="$(util::un_cmd_file_path "${__cmd_file}")"
+			# file path to ko file path
+			if [[ -f "${__un_cmd_file%.o}.ko" ]]; then
+				# now found its parent! exit here
+				eval "${__RETVAL}"="${__un_cmd_file%.o}.ko"
+				return
+			fi
+
+			if ! grep -lw "${__un_cmd_file}" "${__cmd_files[@]}" >& /dev/null; then
+				# no more parent is available for
+				# ${__un_cmd_file}.o. hence, break to go to upper dir.
+				break
+			fi
+
+			local -a __parent_cmd_files=($(grep -lw "${__un_cmd_file}" "${__cmd_files[@]}"))
+			if [[ ${#__parent_cmd_files[@]} == 1 ]]; then
+				__cmd_file="${__parent_cmd_files[0]}"
+				__cmd_files=($(find "${__parent_dir}" -maxdepth 1 \
+							-name '.*.o.cmd' -a \
+							-not -name $(basename "${__cmd_file}")))
+			else
+				util::error "${__un_cmd_file} has ${#__parent_cmd_files[@]} parents"
+			fi
+		done
+
+		# goes to parent dir using `dirname`
+		__parent_dir=$(dirname "${__parent_dir}")
+		if [[ -z ${__parent_dir} ]]; then
+			# this is required for the condition for while loop.
+			__parent_dir="./"
+		fi
+	done
+
+	# couldn't file kernel module w/ the changes in given patched
+	# file. default to 'vmlinux'
+	eval "${__RETVAL}"="${G_KERNEL_VMLINUX}"
 }
