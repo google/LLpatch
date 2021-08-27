@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+#
+# Copyright 2021 Google LLC
+# 
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+# 
+#     https://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Author: yonghyun@google.com (Yonghyun Hwang)
+#
+# script to input .c file for livepatch callbacks, llpatch-callbacks.c and
+# output llpatch symbol map.
+
+#-------------------------------------------------------------
+# Shell setting
+#-------------------------------------------------------------
+set -E
+
+#-------------------------------------------------------------
+# Global variables
+#-------------------------------------------------------------
+declare -r G_GEN_SYMBOL_MAP_CMD="$0"
+declare -r G_GEN_SYMBOL_MAP_CMDLINE="$0 $@"
+declare -r G_GEN_SYMBOL_MAP_PATH=$(dirname $(readlink -f "${G_GEN_SYMBOL_MAP_CMD}"))
+declare -r G_TMP_DIR="$(mktemp -d -t livepatch.XXXXXXXXXX)"
+declare -r G_TMP_FILE="$(mktemp -t livepatch.XXXXXXXXXX)"
+
+declare G_KDIR="$(pwd)"
+declare G_LIVEPATCH_CALLBACK=""
+declare G_OUTPUT_FILE=""
+
+#-------------------------------------------------------------
+# Include library
+#-------------------------------------------------------------
+source "${G_GEN_SYMBOL_MAP_PATH}/libutil.bash" "gen-symbol-map"
+
+#-------------------------------------------------------------
+# Function definitions
+#-------------------------------------------------------------
+function cleanup()
+{
+	local errCode="${1:-}"
+	local lineNum="${2:-}"
+
+	[[ ${errCode} == 0 ]] || \
+		util::log_error "trap at line: ${lineNum}, with error:${errCode}."
+
+	rm -fr "${G_TMP_DIR}" "${G_TMP_FILE}"
+
+	exit "${errCode}"
+}
+# enable exit trap for debugging purpose
+trap 'cleanup $? ${LINENO}' ERR INT TERM EXIT
+
+function print_usage()
+{
+	cat <<EOF
+Usage: $(basename ${G_GEN_SYMBOL_MAP_CMD}) [OPTIONS] llpatch-callbacks.c
+Generate LLpatch symbol map
+
+Options:
+  -h, --help  This help message.
+  -k, --kdir  Path to kernel repository. If not specified, \$pwd is used.
+  -o, --out   Path to output map file
+EOF
+	return 0
+}
+
+function parse_options()
+{
+	local args
+
+	if [[ $# -le 1 ]]; then
+		print_usage
+		exit 0
+	fi
+
+	args=$(getopt -q -n "${G_GEN_SYMBOL_MAP_CMD}" -o h,k:,o: \
+		-l help,kdir:,output:\
+		-- "$@")
+
+	if [[ $? == 1 ]]; then
+		print_usage
+		exit 0
+	fi
+	eval set -- "${args}"
+
+	while true; do
+		local arg="${1}"
+		shift
+		case "${arg}" in
+			-h|--help)
+				print_usage
+				exit 0
+				;;
+			-k|--kdir)
+				G_KDIR="${1}"
+				shift
+				;;
+			-o|--out)
+				G_OUTPUT_FILE="${1}"
+				shift
+				;;
+			*)
+				break;
+		esac
+	done
+
+	# The rest is a patch file
+	G_LIVEPATCH_CALLBACK="$(readlink -f ${1})"
+
+	util::log_ok "Command line options are parsed."
+	return 0
+}
+
+# validate options and prepare symbol map build
+function validate_prepare()
+{
+	[[ -f "${G_LIVEPATCH_CALLBACK}" ]] || \
+		util::error "Given input for livepatch callback, ${G_LIVEPATCH_CALLBACK}, doesn't exist."
+	G_LIVEPATCH_CALLBACK=$(readlink -f "${G_LIVEPATCH_CALLBACK}")
+
+	G_OUTPUT_FILE=$(readlink -f "${G_OUTPUT_FILE}")
+
+	cd "${G_KDIR}" || \
+		util::error "Failed to cd onto git repository for kernel: ${G_KDIR}"
+	[[ -f MAINTAINERS && -d init ]] || \
+		util::error "Invalid git repository for kernel: $(pwd)"
+}
+
+function generate_symbol_map()
+{
+	local -r LIVEPATCH_CALLBACK="${1}"
+	local -r OUPUT_FILE="${2}"
+
+	awk <"${LIVEPATCH_CALLBACK}" '
+		BEGIN {hit = 0; i = 0; path=""; var=""; ll_alias="";}
+		/^ *LLPATCH_DECLARE_SYMBOL/ { hit = 1; }
+		{
+			if(hit != 1) next;
+			# remove space
+			gsub(/\s/, "", $0)
+			# replace () w/ ,
+			gsub(/[()]/, ",", $0)
+			# split line with ,
+			nr_elems = split($0, tokens, ",")
+			for (j = 1; j < nr_elems; j++) {
+				switch(i) {
+				case 2:
+				   ll_alias = tokens[j]; break;
+				case 3:
+				   path = tokens[j]; break;
+				case 4:
+				   var = tokens[j]; break;
+				}
+				i++;
+			}
+		}
+		/;/ {
+			print path, var, ll_alias
+			hit = 0; i = 0; path=""; var=""; ll_alias="";
+		}
+		END {}
+	' >| "${G_TMP_FILE}"
+	util::log_ok "Livepatch callback, $(basename ${LIVEPATCH_CALLBACK}), is parsed"
+
+	>| "${G_OUTPUT_FILE}"
+	util::log_info "Printing map info"
+	local line=""
+	while read -r line; do
+		local -a tokens=($line)
+		local path="${tokens[0]}"
+		local gvar="${tokens[1]}"
+		local ll_alias="${tokens[2]}"
+
+		local obj_parent=""
+		util::__find_obj_parent "${path%.c}.o" "obj_parent"
+		local mod_name=$(modinfo -F 'name' $obj_parent)
+
+		printf "\tModule: %s\tPath: %s\n\tGvar: %s\t\tAlias: %s\n" \
+			   "${mod_name}" "${path}" "${gvar}" "${ll_alias}"
+		echo "${mod_name}" "${path}" "${gvar}" "${ll_alias}" >> \
+			 "${G_OUTPUT_FILE}"
+	done < "${G_TMP_FILE}"
+	util::log_ok "Output file, ${G_OUTPUT_FILE}, is generated"
+}
+
+#-------------------------------------------------------------
+# Main starts here
+#-------------------------------------------------------------
+parse_options "$@"
+
+validate_prepare
+
+generate_symbol_map "${G_LIVEPATCH_CALLBACK}" "${G_OUTPUT_FILE}"
+
+exit 0
