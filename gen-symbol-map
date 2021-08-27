@@ -68,7 +68,7 @@ Generate LLpatch symbol map
 
 Options:
   -h, --help  This help message.
-  -k, --kdir  Path to kernel repository. If not specified, \$pwd is used.
+  -k, --kdir  Path to kernel repository. If not specified, \$PWD is used.
   -o, --out   Path to output map file
 EOF
 	return 0

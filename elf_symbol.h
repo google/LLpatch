@@ -115,6 +115,8 @@ class ElfSymbol final {
 	void SetSectionIndex(SectionIndex idx, size_t cursor);
 
 	bool IsKLPLocalSymbol() const noexcept(false);
+	bool IsLLpatchSymbol() const noexcept(false);
+	std::string_view GetLLpatchSymbolAlias() const;
 
 	static std::string CreateKlpLocalSymName(llvm::StringRef sym_name);
 	static std::string

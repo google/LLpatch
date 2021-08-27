@@ -39,6 +39,9 @@ struct Command {
 		INVALID_PATCH_FILE = 6,
 		NOTHING_TO_PATCH = 7,
 		SYM_FIND_FAILED = 8,
+		INVALID_SYM_MAP = 9,
+		ALIAS_FIND_FAILED = 10,
+		NO_SYM_MAP = 11,
 	};
 
 	virtual ~Command() = default;

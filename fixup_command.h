@@ -60,6 +60,7 @@ class FixupCommand : public Command {
 	std::error_code CreateKlpRela(ElfBin *elf_bin);
 	std::error_code RenameKlpSymbols(ElfBin *elf_bin,
 					 std::string_view mod_filename,
+					 std::string_view symbol_map,
 					 std::string_view thin_archive);
 
 	std::string klp_patch_filename_;
@@ -67,6 +68,7 @@ class FixupCommand : public Command {
 	// module is required. For now, the fixup command assumes changes in
 	// "single" kernel module.
 	std::string mod_filename_;
+	std::string symbol_map_;
 	std::string thin_archive_;
 	bool create_klp_rela_ = false;
 	llvm::raw_ostream &out_;

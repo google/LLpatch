@@ -37,6 +37,7 @@
 #include "elf_bin.h"
 #include "elf_rela.h"
 #include "elf_symbol.h"
+#include "symbol_map.h"
 #include "thin_archive.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -46,6 +47,7 @@ namespace
 struct FixupArgs {
 	char *klp_patch_filename = nullptr;
 	char *mod_filename = nullptr;
+	char *symbol_map = nullptr;
 	char *thin_archive = nullptr;
 	bool create_klp_rela = false;
 	bool quiet_mode = false;
@@ -57,6 +59,8 @@ const struct argp_option kFixupOptions[] = {
 	// name, key, arg, flags, doc,
 	{ "mod", 'm', "MOD", 0,
 	  "Path to kernel module. For vmlinux, don't specify" },
+	{ "symbol_map", 's', "SYMBOL_MAP", 0,
+	  "Symbol map file for LLpatch symbols in livepatch wrapper" },
 	{ "thin_archive", 't', "THIN_ARCHIVE", 0,
 	  "Thin archive file for kernel module or vmlinux" },
 	{ "rela", 'r', nullptr, 0, "Create relocation section for KLP" },
@@ -81,6 +85,9 @@ error_t ParseFixupOpt(int key, char *arg, struct argp_state *state)
 		break;
 	case 'q':
 		args->quiet_mode = true;
+		break;
+	case 's':
+		args->symbol_map = arg;
 		break;
 	case 't':
 		args->thin_archive = arg;
@@ -197,6 +204,7 @@ std::error_code FixupCommand::CreateKlpRela(ElfBin *elf_bin)
 
 std::error_code FixupCommand::RenameKlpSymbols(ElfBin *elf_bin,
 					       std::string_view mod_filename,
+					       std::string_view symbol_map,
 					       std::string_view thin_archive)
 {
 	// Load names for all "defined" symbols in kernel module if specified.
@@ -219,6 +227,18 @@ std::error_code FixupCommand::RenameKlpSymbols(ElfBin *elf_bin,
 	// for string section has '\0' by default.
 	std::vector<char> sym_name_buf{ '\0' };
 	ElfSymbol elf_symbols = elf_bin->Symbols();
+	size_t sym_name_offset = 0;
+
+	auto RenameSymbol = [&sym_name_buf, &sym_name_offset](
+				    ElfSymbol *i,
+				    const std::string_view new_name) {
+		std::copy(new_name.begin(), new_name.end(),
+			  std::back_insert_iterator<std::vector<char> >(
+				  sym_name_buf));
+		sym_name_buf.push_back('\0');
+		i->Rename(sym_name_offset);
+		sym_name_offset = sym_name_buf.size();
+	};
 
 	// This loop iterates through all symbols in the ELF binary and renames
 	// symbol if it's undefined. While renaming the symbol, it also builds
@@ -226,23 +246,46 @@ std::error_code FixupCommand::RenameKlpSymbols(ElfBin *elf_bin,
 	// string section in ELF binary after this loop.
 	std::unique_ptr<ThinArchive> tar =
 		ThinArchive::Create(std::string(thin_archive));
+	std::unique_ptr<SymbolMap> sym_map =
+		SymbolMap::Create(std::string(symbol_map));
 	for (ElfSymbol *i : elf_symbols) {
-		size_t sym_name_offset = sym_name_buf.size();
-
 		// __fentry__ is for kernel's ftrace. don't touch even though it's UND.
-		if (i->HasSectionIndex(ElfSymbol::SectionIndex::UNDEF) &&
-		    i->Name() != "__fentry__") {
-			StringRef RealSymName = i->Name();
-			StringRef SrcFile;
-			std::string SymName = std::string(i->Name());
+		if (!i->HasSectionIndex(ElfSymbol::SectionIndex::UNDEF) ||
+		    i->Name() == "__fentry__") {
+			RenameSymbol(i, i->Name());
+			continue;
+		}
 
+		StringRef RealSymName = i->Name();
+		StringRef SrcFile;
+		std::string SymName = std::string(i->Name());
+		std::string RealSymNameStr = RealSymName.str();
+
+		if (sym_map) {
+			if (i->IsLLpatchSymbol()) {
+				auto alias = i->GetLLpatchSymbolAlias();
+				const auto &sym_entry =
+					sym_map->QueryAlias(std::string(alias));
+				RealSymName =
+					sym_entry[SymbolMap::ElemIndex::SYMBOL];
+				SrcFile = sym_entry[SymbolMap::ElemIndex::PATH];
+				mod_name =
+					sym_entry[SymbolMap::ElemIndex::MOD_NAME] +
+					".";
+				RealSymNameStr.assign(RealSymName);
+			} else {
+				// with symbol map given, only llpatch symbol should be KLP
+				// symbol.
+				RenameSymbol(i, RealSymNameStr);
+				continue;
+			}
+		} else {
 			if (i->IsKLPLocalSymbol()) {
 				auto SplitName = RealSymName.split(':');
 				RealSymName = SplitName.second.split(':').first;
 				SrcFile = SplitName.second.split(':').second;
+				RealSymNameStr.assign(RealSymName);
 			}
-
-			std::string RealSymNameStr = RealSymName.str();
 
 			if (mod_name != kObjVmlinux &&
 			    mod_symbol_set.find(RealSymNameStr) ==
@@ -250,64 +293,50 @@ std::error_code FixupCommand::RenameKlpSymbols(ElfBin *elf_bin,
 				// given kernel module doesn't have symbol name, which
 				// implies EXPORTed symbol. So, do not mark this as
 				// livepatched symbol.
-				const std::string_view &name = RealSymNameStr;
-				std::copy(name.begin(), name.end(),
-					  std::back_insert_iterator<
-						  std::vector<char> >(
-						  sym_name_buf));
-				sym_name_buf.push_back('\0');
-				i->Rename(sym_name_offset);
+				RenameSymbol(i, RealSymNameStr);
 				continue;
 			}
-
-			i->SetSectionIndex(ElfSymbol::SectionIndex::LIVEPATCH);
-
-			// Rename the symbol for livepatching. The following is the format.
-			//
-			//   .klp.sym.objname.symbol_name,sympos
-			//   ^       ^^     ^ ^         ^ ^
-			//   |_______||_____| |_________| |
-			//      [A]     [B]       [C]    [D]
-			//
-			// [A]: Prefix
-			// [B]: vmlinux or module name that the symbol belongs.
-			// [C]: Actual name of the symbol.
-			// [D]: The position of the symbol in the object (as according
-			//      to kallsyms) This is used to differentiate
-			//      duplicate symbols within the same object. The
-			//      symbol position is expressed numerically (0, 1,
-			//      2, ...). The symbol position of a unique symbol
-			//      is 0.
-			unsigned pos = 0;
-			if (tar) {
-				const auto& symbol = RealSymName.str();
-				const auto& filename = SrcFile.rsplit('.').first.str() + ".o";
-					pos = tar->QuerySymbol(symbol, filename);
-				if (pos < 0) {
-					errs() << "Symbol: " << symbol
-						<< ", Filename: " << filename << "\n"
-						<< "Fail to find the symbol in thin archive\n";
-					return Command::ErrorCode::SYM_FIND_FAILED;
-				}
-			}
-
-			const std::string kKlpSymName =
-				std::string(kKlpPrefix) + mod_name +
-				RealSymNameStr + "," + std::to_string(pos);
-
-			out_ << "KLP Symbols::" << RealSymNameStr << " --> "
-			     << kKlpSymName << "\n";
-			std::copy(kKlpSymName.begin(), kKlpSymName.end(),
-				  std::back_insert_iterator<std::vector<char> >(
-					  sym_name_buf));
-		} else {
-			const std::string_view &name = i->Name();
-			std::copy(name.begin(), name.end(),
-				  std::back_insert_iterator<std::vector<char> >(
-					  sym_name_buf));
 		}
-		sym_name_buf.push_back('\0');
-		i->Rename(sym_name_offset);
+
+		i->SetSectionIndex(ElfSymbol::SectionIndex::LIVEPATCH);
+
+		// Rename the symbol for livepatching. The following is the format.
+		//
+		//   .klp.sym.objname.symbol_name,sympos
+		//   ^       ^^     ^ ^         ^ ^
+		//   |_______||_____| |_________| |
+		//      [A]     [B]       [C]    [D]
+		//
+		// [A]: Prefix
+		// [B]: vmlinux or module name that the symbol belongs.
+		// [C]: Actual name of the symbol.
+		// [D]: The position of the symbol in the object (as according
+		//      to kallsyms) This is used to differentiate
+		//      duplicate symbols within the same object. The
+		//      symbol position is expressed numerically (0, 1,
+		//      2, ...). The symbol position of a unique symbol
+		//      is 0.
+		int pos = 0;
+		if (tar) {
+			const auto &symbol = RealSymName.str();
+			const auto &filename =
+				SrcFile.rsplit('.').first.str() + ".o";
+			pos = tar->QuerySymbol(symbol, filename);
+			if (pos < 0) {
+				errs() << "Symbol: " << symbol
+				       << ", Filename: " << filename << "\n"
+				       << "Fail to find the symbol in thin archive\n";
+				return Command::ErrorCode::SYM_FIND_FAILED;
+			}
+		}
+
+		const std::string kKlpSymName = std::string(kKlpPrefix) +
+						mod_name + RealSymNameStr +
+						"," + std::to_string(pos);
+
+		out_ << "KLP Symbols::" << RealSymNameStr << " --> "
+		     << kKlpSymName << "\n";
+		RenameSymbol(i, kKlpSymName);
 	}
 
 	// A new memory buffer for symbol name is built up in
@@ -355,6 +384,10 @@ std::unique_ptr<FixupCommand> FixupCommand::Create(int argc, char **argv)
 		cmd->thin_archive_ = arguments.thin_archive;
 	}
 
+	if (arguments.symbol_map) {
+		cmd->symbol_map_ = arguments.symbol_map;
+	}
+
 	return std::unique_ptr<FixupCommand>(cmd);
 }
 
@@ -365,7 +398,8 @@ std::error_code FixupCommand::Run()
 	if (create_klp_rela_) {
 		ec = CreateKlpRela(&elf_bin);
 	} else {
-		ec = RenameKlpSymbols(&elf_bin, mod_filename_, thin_archive_);
+		ec = RenameKlpSymbols(&elf_bin, mod_filename_, symbol_map_,
+				      thin_archive_);
 	}
 
 	return ec;
