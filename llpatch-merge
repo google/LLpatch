@@ -28,11 +28,17 @@ set -E
 #-------------------------------------------------------------
 declare -r G_LLPATCH_MERGE_CMD="$0"
 declare -r G_LLPATCH_PATH=$(dirname $(readlink -f "${G_LLPATCH_MERGE_CMD}"))
+declare -r G_LLPATCH_HEADER="${G_LLPATCH_PATH}/templates/llpatch.h"
+declare -r G_LLPATCH_SYMBOL_MAP_FILE="llpatch_sym_map.txt"
 declare -r G_LIVEPATCH_BIN="${G_LLPATCH_PATH}/livepatch"
+declare -r G_GEN_SYM_MAP="${G_LLPATCH_PATH}/gen-symbol-map"
+declare -r G_LIVEPATCH_WRAPPER_SOURCE="livepatch.c"
 declare -r G_CREATE_PACKAGE="${G_LLPATCH_PATH}/create-package"
-declare -r G_TMP_DIR="$(mktemp -d -t livepatch.XXXXXXXXXX)"
+declare -r G_TMP_DIR="$(mktemp -d -t llpatch-merge.XXXXXXXXXX)"
 declare -r G_PREFIX_LLPATCH="llpatch"
 declare -r G_CMD_LOG_FILE="${G_TMP_DIR}/$(basename "${G_LLPATCH_MERGE_CMD}").cmds"
+declare -r G_SUFFIX_TAR="thin"
+declare -r G_TMP_TAR_FILE="$(mktemp -t tar.XXXXXXXXXX)"
 
 declare -a G_KLP_DIRS=()
 declare G_BUILD_ARCH="x86_64"
@@ -42,6 +48,7 @@ declare G_ODIR=""
 declare G_LD_CMD=""
 declare G_KLP_NAME="klp_merge"
 declare G_SKIP_PKG_BUILD=false
+declare G_PATCH_CALLBACK_FILE="${G_LLPATCH_PATH}/templates/llpatch-callbacks.c"
 
 #-------------------------------------------------------------
 # Include library
@@ -59,6 +66,7 @@ function cleanup()
 	[[ ${errCode} == 0 ]] || \
 		util::log_error "trap at line: ${lineNum}, with error:${errCode}."
 
+	rm -f "${G_TMP_TAR_FILE}"
 	if [[ -n "${G_DEBUG_DIR}" ]]; then
 		sed -i -e "s|"${G_TMP_DIR}"|"${G_DEBUG_DIR}"|g" \
 			"${G_CMD_LOG_FILE}"
@@ -83,6 +91,8 @@ KLP dirs: Output directories by llpatch with --skip-pkg-build option.
 Options:
       --arch=ARCH   CPU architecture for livepatch. arm64 and x86_64 are
                     supported. Default: ${G_BUILD_ARCH}
+  -c, --callbacks   .c file implementing callbacks for livepatch
+               Find templates/llpatch-callbacks.c and tweak it
   -n, --name=NAME   Name of kernel livepatch. Default: ${G_KLP_NAME}
   -k, --kdir=PATH   Path to kernel repository. Default to current directory.
   -o, --odir=PAtH   Path to output directory. Default: '\$kdir/pkgs'
@@ -115,8 +125,8 @@ function parse_options()
 		exit 0
 	fi
 
-	args=$(getopt -q -n "${G_LLPATCH_MERGE_CMD}" -o h,k:,n:,o: \
-		-l arch:,debug-dir:,help,kdir:,name:,odir:,skip-pkg-build \
+	args=$(getopt -q -n "${G_LLPATCH_MERGE_CMD}" -o c:,h,k:,n:,o: \
+		-l arch:,callbacks:,debug-dir:,help,kdir:,name:,odir:,skip-pkg-build \
 		-- "$@")
 
 	if [[ $? == 1 ]]; then
@@ -131,6 +141,10 @@ function parse_options()
 		case "${arg}" in
 			--arch)
 				G_BUILD_ARCH="${1}"
+				shift
+				;;
+			-c|--callbacks)
+				G_PATCH_CALLBACK_FILE="${1}"
 				shift
 				;;
 			--debug-dir)
@@ -216,6 +230,10 @@ function validate_prepare()
 			util::error "Dir, ${G_DEBUG_DIR}, for debugging exists."
 		G_DEBUG_DIR="$(readlink -f ${G_DEBUG_DIR})"
 	fi
+
+	[[ -f "${G_PATCH_CALLBACK_FILE}" ]] || \
+		util::error "file for callbacks doesn't exist "
+	G_PATCH_CALLBACK_FILE="$(readlink -f "${G_PATCH_CALLBACK_FILE}")"
 
 	cd "${G_KDIR}" || \
 		util::error "Failed to cd onto git repository for kernel: ${G_KDIR}"
@@ -310,8 +328,7 @@ function get_obj_func_name()
 function generate_livepatch_wrapper()
 {
 	util::log_info "Generate livepatch wrapper"
-	local -r LIVEPATCH="livepatch.c"
-	local -r LIVEPATCH_WRAPPER="${G_TMP_DIR}/${LIVEPATCH}"
+	local -r LIVEPATCH_WRAPPER="${G_TMP_DIR}/${G_LIVEPATCH_WRAPPER_SOURCE}"
 	local -r LIVEPATCH_TEMPLATE="${G_LLPATCH_PATH}/templates/livepatch.c.tmpl"
 
 	# generate #include && comments
@@ -321,7 +338,7 @@ function generate_livepatch_wrapper()
 	# generate list of livepatch functions
 	local klp_dir=""
 	for klp_dir in ${G_KLP_DIRS[@]}; do
-		grep '^void livepatch_' "${klp_dir}/${LIVEPATCH}"
+		grep '^void livepatch_' "${klp_dir}/${G_LIVEPATCH_WRAPPER_SOURCE}"
 	done >> "${LIVEPATCH_WRAPPER}"
 
 	# construct map of klp objs, while expecting the following source code
@@ -338,12 +355,12 @@ function generate_livepatch_wrapper()
 	for klp_dir in ${G_KLP_DIRS[@]}; do
 		# get name of object.
 		local obj_name=$(
-			awk <"${klp_dir}/${LIVEPATCH}" "
+			awk <"${klp_dir}/${G_LIVEPATCH_WRAPPER_SOURCE}" '
 			BEGIN {hit = 0}
 			/static struct klp_object objs/ { hit = 1; }
-			/\t\t.name =/ { if (hit == 1) {print \$3; hit--; exit 0} }
+			/\t\t.name =/ { if (hit == 1) {print $3; hit--; exit 0} }
 			END {if (hit < 0) exit 1}
-			")
+			')
 
 		# ".name = NULL," or ".name = $kmod_name,". so, it should end with ","
 		# remove ","
@@ -378,17 +395,18 @@ function generate_livepatch_wrapper()
 			klp_dir=${klp_dir_list%%${OBJ_NAME_SEP}*}
 			klp_dir_list=${klp_dir_list#*${OBJ_NAME_SEP}}
 
-			# dump "static struct klp_func" for given klp dir. The awk assumes specific
-			# formats for "struct klp_func funcs[]" in ${klp_dir}/${LIVEPATCH}. If
-			# $llpatch/tempates/livepatch.c.tmpl is updated, The following awk process
-			# should be updated as well.
-			awk <"${klp_dir}/${LIVEPATCH}" "
+			# dump "static struct klp_func" for given klp dir. The awk
+			# assumes specific formats for "struct klp_func funcs[]" in
+			# ${klp_dir}/${G_LIVEPATCH_WRAPPER_SOURCE}. If
+			# $llpatch/tempates/livepatch.c.tmpl is updated, The following
+			# awk process should be updated as well.
+			awk <"${klp_dir}/${G_LIVEPATCH_WRAPPER_SOURCE}" '
 				BEGIN {hit = 0}
 				/static struct klp_func funcs/ {hit = 1}
 				/\t\{\}/ { hit--; exit 0 }
-				/\t/ { if (hit >= 1) print \$0 }
+				/\t/ { if (hit >= 1) print $0 }
 				END { if (hit != 0) exit 1}
-				" || util::error "Cannot Parse klp_func tables"
+				' || util::error "Cannot Parse klp_func tables"
 
 			if [[ "${klp_dir}" == "${klp_dir_list}" ]]; then
 				break
@@ -406,7 +424,12 @@ function generate_livepatch_wrapper()
 		obj_name="${obj_name#\"}"
 		obj_name="${obj_name%\"}"
 		printf "\t\t.funcs = $(get_obj_func_name "${obj_name}"),\n"
-
+		printf "\t\t.callbacks = {\n"
+		printf "\t\t	.pre_patch = pre_patch_callback,\n"
+		printf "\t\t	.post_patch = post_patch_callback,\n"
+		printf "\t\t	.pre_unpatch = pre_unpatch_callback,\n"
+		printf "\t\t	.post_unpatch = post_unpatch_callback,\n"
+		printf "\t\t},\n"
 		printf "\t},\n"
 	done >> "${LIVEPATCH_WRAPPER}"
 	printf "\t{}\n};\n" >> "${LIVEPATCH_WRAPPER}"
@@ -414,6 +437,17 @@ function generate_livepatch_wrapper()
 	# dump till the end of template for livepatch_init() && livepatch_exit()
 	sed -n '/^static struct klp_patch patch/,$p' \
 		"${LIVEPATCH_TEMPLATE}" >> "${LIVEPATCH_WRAPPER}"
+
+	cp -f "${G_LLPATCH_HEADER}" "${G_TMP_DIR}"
+	cp -f "${G_PATCH_CALLBACK_FILE}" "${G_TMP_DIR}"
+
+	sed -i -e "s|"{{LLPATCH_CALLBACKS}}"|$(basename "${G_PATCH_CALLBACK_FILE}")|g" \
+		"${LIVEPATCH_WRAPPER}"
+
+	run_command "${G_GEN_SYM_MAP}" \
+		-k "${G_KDIR}" \
+		-o "${G_TMP_DIR}/${G_LLPATCH_SYMBOL_MAP_FILE}" \
+		"${G_PATCH_CALLBACK_FILE}" 
 
 	util::log_ok "Livepatch wrapper complete"
 	return 0
@@ -441,16 +475,31 @@ function generate_makefile()
 
 function build_livepatch()
 {
+	local -ra BUILD_COMMAND=("${MAKE:-make}" \
+			 CLANG=1 LLVM=1 \
+			 M="${G_TMP_DIR}" ARCH=${G_BUILD_ARCH})
+
+	pushd "${G_TMP_DIR}" >& /dev/null
+
 	util::log_info "Building kernel livepatch"
-	# for now, use kbuild only for arm64.
-	if [[ ${G_BUILD_ARCH} == "arm64" ]]; then
-		make ARCH=arm64 M="${G_TMP_DIR}"
-	else
-		# "-C ${G_TMP_DIR}" for make doesn't work for kernel module build here
-		pushd "${G_TMP_DIR}" >& /dev/null
-		"${MAKE:-make}" CLANG=1 LLVM=1
-		popd  >& /dev/null
-	fi
+
+	local -r LIVEPATCH_OBJ="${G_LIVEPATCH_WRAPPER_SOURCE%.c}.o"
+	util::log_info "Build ${LIVEPATCH_OBJ} and resolve LLPatch symbols"
+
+	run_command "${BUILD_COMMAND[@]}" -C "${G_KDIR}" "${LIVEPATCH_OBJ}"
+
+	# TODO: we need thin archive files here. need to add a new option to get dir for thin archives
+	>| "${G_TMP_TAR_FILE}"
+	run_command "${G_LIVEPATCH_BIN}" fixup -q \
+				--symbol_map="${G_TMP_DIR}/${G_LLPATCH_SYMBOL_MAP_FILE}" \
+				--thin_archive="${G_TMP_TAR_FILE}" \
+				"${LIVEPATCH_OBJ}"
+	util::log_ok "LLPatch symbols are resolved"
+
+	"${BUILD_COMMAND[@]}"
+	util::log_ok "Livepatch is built"
+
+	popd  >& /dev/null
 
 	# before fixing up, make a backup
 	util::log_info "Creating KLP rela section"
