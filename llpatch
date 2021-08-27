@@ -30,15 +30,21 @@ declare -r G_LIVEPATCH_CMD="$0"
 declare -r G_LIVEPATCH_CMDLINE="$0 $@"
 declare -r G_LIVEPATCH_PATH=$(dirname $(readlink -f "${G_LIVEPATCH_CMD}"))
 declare -r G_LIVEPATCH_BIN="${G_LIVEPATCH_PATH}/livepatch"
+declare -r G_LIVEPATCH_HEADER="${G_LIVEPATCH_PATH}/templates/llpatch.h"
+declare -r G_LIVEPATCH_WRAPPER="livepatch.c"
+declare -r G_LLPATCH_SYMBOL_MAP_FILE="llpatch_sym_map.txt"
 declare -r G_LIVEPATCH_CC="${G_LIVEPATCH_PATH}/livepatch-cc"
 declare -r G_LIVEPATCH_COMPILE="${G_LIVEPATCH_PATH}/livepatch-compile"
 declare -r G_LIVEPATCH_MERGE="${G_LIVEPATCH_PATH}/llpatch-merge"
 declare -r G_CREATE_PACKAGE="${G_LIVEPATCH_PATH}/create-package"
+declare -r G_GEN_SYM_MAP="${G_LIVEPATCH_PATH}/gen-symbol-map"
 declare -r G_SCRIPT_VERSION="$(sha1sum "$0" | cut -d' ' -f1)"
 declare -r G_TMP_DIR="$(mktemp -d -t livepatch.XXXXXXXXXX)"
 declare -r G_SUFFIX_ALIGNED="__aligned"
 declare -r G_SUFFIX_ORIGINAL="__original"
 declare -r G_SUFFIX_PATCHED="__patched"
+declare -r G_SUFFIX_TAR="thin"
+declare -r G_TMP_TAR_FILE="$(mktemp -t tar.XXXXXXXXXX)"
 declare -r G_SUFFIX_LLVM_IR_ORIGINAL="${G_SUFFIX_ORIGINAL}.ll"
 declare -r G_SUFFIX_LLVM_IR_PATCHED="${G_SUFFIX_PATCHED}.ll"
 declare -r G_SUFFIX_KLP_DIFF=".c__klp_diff"
@@ -48,6 +54,7 @@ declare -r G_CMD_LOG_FILE="${G_TMP_DIR}/$(basename "${G_LIVEPATCH_CMD}").cmds"
 declare G_THIN_ARCHIVE=""
 declare G_PATCH_FILE
 declare G_TMP_CMD_FILE_LIST="$(mktemp -t kernel.o.cmds.XXXXXXXXXX)"
+declare G_PATCH_CALLBACK_FILE="${G_LIVEPATCH_PATH}/templates/llpatch-callbacks.c"
 declare -i G_PATCHED_DIRTY=0
 declare G_KDIR="$(pwd)"
 declare G_ODIR=""
@@ -92,7 +99,7 @@ function cleanup()
 		G_PATCHED_DIRTY=0
 	fi
 
-	rm -f "${G_TMP_CMD_FILE_LIST}"
+	rm -f "${G_TMP_CMD_FILE_LIST}" "${G_TMP_TAR_FILE}"
 	rm -fr "${G_TMP_MERGE_DIR}"
 	if [[ -n "${G_DEBUG_DIR}" ]]; then
 		sed -i -e "s|"${G_TMP_DIR}"|"${G_DEBUG_DIR}"|g" \
@@ -120,6 +127,8 @@ File: .patch file to use for the livepatch package build.
 Options:
   --arch       CPU architecture for livepatch. arm64 and x86_64 are supported.
                Default is x86_64.
+  -c, --callbacks   .c file implementing callbacks for livepatch
+               Find templates/llpatch-callbacks.c and tweak it
   -h, --help   This help message.
   -k, --kdir   Path to kernel repository. If not specified, `pwd` is used.
   -o, --odir   Path to output directory. If not specified, '$kdir/pkgs' is used.
@@ -154,8 +163,8 @@ function parse_options()
 		exit 0
 	fi
 
-	args=$(getopt -q -n "${G_LIVEPATCH_CMD}" -o h,k:,o: \
-		-l arch:,debug-dir:,help,kdir:,multi,odir:,skip-pkg-build,slow-path \
+	args=$(getopt -q -n "${G_LIVEPATCH_CMD}" -o c:h,k:,o: \
+		-l arch:,callbacks:,debug-dir:,help,kdir:,multi,odir:,skip-pkg-build,slow-path \
 		-- "$@")
 
 	if [[ $? == 1 ]]; then
@@ -170,6 +179,10 @@ function parse_options()
 		case "${arg}" in
 			--arch)
 				G_BUILD_ARCH="${1}"
+				shift
+				;;
+			-c|--callbacks)
+				G_PATCH_CALLBACK_FILE="${1}"
 				shift
 				;;
 			--debug-dir)
@@ -233,6 +246,10 @@ function validate_prepare()
 			util::error "Dir, ${G_DEBUG_DIR}, for debugging exists."
 		G_DEBUG_DIR="$(readlink -f ${G_DEBUG_DIR})"
 	fi
+
+	[[ -f "${G_PATCH_CALLBACK_FILE}" ]] || \
+		util::error "file for callbacks doesn't exist "
+	G_PATCH_CALLBACK_FILE="$(readlink -f "${G_PATCH_CALLBACK_FILE}")"
 
 	cd "${G_KDIR}" || \
 		util::error "Failed to cd onto git repository for kernel: ${G_KDIR}"
@@ -564,7 +581,7 @@ function generate_thin_archive_txt()
 		return 0
 	fi
 
-	local -r __THIN_ARCHIVE_TXT="${G_TMP_DIR}/$(basename "${__THIN_ARCHIVE}").thin"
+	local -r __THIN_ARCHIVE_TXT="${G_TMP_DIR}/$(basename "${__THIN_ARCHIVE}").${G_SUFFIX_TAR}"
 	if [[ -f ${__THIN_ARCHIVE_TXT} ]]; then
 		eval "${__RETVAL}"="${__THIN_ARCHIVE_TXT}"
 		return 0
@@ -795,13 +812,27 @@ function generate_klp()
 			--name="${klp_mod_name%.ko}" \
 			"${KLP_PATCH_OBJ}"
 
+	sed -i -e "s|"{{LLPATCH_CALLBACKS}}"|$(basename "${G_PATCH_CALLBACK_FILE}")|g" \
+		"${KLP_OBJ_ROOT}/${G_LIVEPATCH_WRAPPER}"
+
 	util::log_ok "Wrapper, linker script, and Makefile are generated"
 
 	# enforce suffix for patch file to be $G_UTIL_SUFFIX_PATCH for llpatch-multi
 	local patch_file="$(basename ${G_PATCH_FILE})"
 	patch_file="${patch_file%.*}.${G_UTIL_SUFFIX_PATCH}"
 	cp -f "${G_PATCH_FILE}" "${KLP_OBJ_ROOT}/${patch_file}"
+
 	generate_buildinfo "$(get_buildinfo "${OBJ_PARENT}")"
+
+	cp -f "${G_LIVEPATCH_HEADER}" "${KLP_OBJ_ROOT}"
+	cp -f "${G_PATCH_CALLBACK_FILE}" "${KLP_OBJ_ROOT}"
+
+	# only callback file can have symbol map described by *LLPATCH_SYMBOL
+	# macros.
+	run_command "${G_GEN_SYM_MAP}" \
+		-k "${G_KDIR}" \
+		-o "${KLP_OBJ_ROOT}/${G_LLPATCH_SYMBOL_MAP_FILE}" \
+		"${G_PATCH_CALLBACK_FILE}" 
 }
 
 # Generate kernel livepatch
@@ -843,16 +874,28 @@ function package_build()
 	local -r KLP_OBJ_ROOT="$(get_klp_obj_root "${OBJ_PARENT}")"
 
 	util::log_info "Building kernel livepatch"
-	# for now, use kbuild for arm64.
-	if [[ ${G_BUILD_ARCH} == "arm64" ]]; then
-		make ARCH=arm64 M="${KLP_OBJ_ROOT}"
-	else
-		# "-C ${KLP_OBJ_ROOT}" for make doesn't work for kernel module build here
-		pushd "${KLP_OBJ_ROOT}" >& /dev/null
-		"${MAKE:-make}" CLANG=1 LLVM=1
-		popd  >& /dev/null
-	fi
+
+	local -ra BUILD_COMMAND=("${MAKE:-make}" \
+			CLANG=1 LLVM=1 \
+			M="${KLP_OBJ_ROOT} ARCH=${G_BUILD_ARCH}")
+
+	pushd "${KLP_OBJ_ROOT}" >& /dev/null
+
+	local -r LIVEPATCH_OBJ="${G_LIVEPATCH_WRAPPER%.c}.o"
+	util::log_info "Build ${LIVEPATCH_OBJ} and resolve LLPatch symbols"
+	run_command "${BUILD_COMMAND[@]}" -C "${G_KDIR}" "${LIVEPATCH_OBJ}"
+
+	cat "${G_TMP_DIR}/"*".${G_SUFFIX_TAR}" >| "${G_TMP_TAR_FILE}"
+	run_command "${G_LIVEPATCH_BIN}" fixup -q \
+				--symbol_map="${KLP_OBJ_ROOT}/${G_LLPATCH_SYMBOL_MAP_FILE}" \
+				--thin_archive="${G_TMP_TAR_FILE}" \
+				"${LIVEPATCH_OBJ}"
+	util::log_ok "LLPatch symbols are resolved"
+
+	"${BUILD_COMMAND[@]}"
 	util::log_ok "Livepatch is built"
+
+	popd  >& /dev/null
 
 	# before creating KLP rela section, make a backup
 	local -r KLP_MOD_NAME="$(util::get_livepatch_ko_name "${G_PATCH_FILE}")"

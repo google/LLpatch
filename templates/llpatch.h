@@ -20,16 +20,18 @@
 
 /*
  * This macro provides a way to access global variables defined in kmod or
- * vmlinux. This is highly useful if livepatch wants to access the
- * variables before/after applying the livepatch.  One possible example
- * would be to access/obtain a lock before applying the livepatch. This
- * also can be used to add "shadow" variables before livepatch and use it
- * in an actual patch.
+ * vmlinux. This is highly useful if livepatch wants to access the variables
+ * before/after applying the livepatch.  One possible example would be to
+ * access/obtain a lock before applying the livepatch. This also can be used to
+ * add "shadow" variables for livepatch. Accessing the original bindings of the
+ * variables which the patch will redefine, to allow a constructor for a new
+ * shadow variable to initialize it from old value For background on the shadow
+ * variable, see kernel's Documentation/livepatch/shadow-vars.txt.
  *
  * The following example shows how to access global variable defined in
  * ${KDIR}/kernel/livepatch/test/test-attr-apple.c in livepatch.c
  *
- * // in kernel/livepatch/test/test-attr-apple.c
+ * // in kernel/livepatch/test/test-attr-apple.c, part of test-klp.ko
  * static char fruit[PAGE_SIZE] = "apple";
  *
  * // in the livepatch.c, livepatch wrapper
