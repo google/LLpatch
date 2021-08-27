@@ -38,6 +38,7 @@ using namespace llvm;
 namespace
 {
 StringRef kKLPLocalSym("klp.local.sym");
+StringRef kLLpatchSym("__llpatch_symbol_");
 
 void throw_gelf_error()
 {
@@ -174,6 +175,19 @@ void ElfSymbol::SetGElfSymbol(GElf_Sym *sym, size_t cursor) noexcept(false)
 bool ElfSymbol::IsKLPLocalSymbol() const noexcept(false)
 {
 	return StringRef(Name()).startswith(Twine(kKLPLocalSym, ":").str());
+}
+
+bool ElfSymbol::IsLLpatchSymbol() const noexcept(false)
+{
+	return StringRef(Name()).startswith(kLLpatchSym);
+}
+
+std::string_view ElfSymbol::GetLLpatchSymbolAlias() const noexcept(false)
+{
+	if (!IsLLpatchSymbol()) {
+		return "";
+	}
+	return Name().substr(kLLpatchSym.size(), std::string::npos);
 }
 
 std::string ElfSymbol::CreateKlpLocalSymName(StringRef sym_name)

@@ -66,6 +66,15 @@ std::string CommandErrorCategory::message(int ev) const
 	case Command::ErrorCode::SYM_FIND_FAILED:
 		msg = "symbol not found in thin archive";
 		break;
+	case Command::ErrorCode::INVALID_SYM_MAP:
+		msg = "invalid symbol map file";
+		break;
+	case Command::ErrorCode::ALIAS_FIND_FAILED:
+		msg = "alias not found in symbol map";
+		break;
+	case Command::ErrorCode::NO_SYM_MAP:
+		msg = "no symbol map file to resolve symbol alias";
+		break;
 	default:
 		msg = "unrecognized error";
 		break;
