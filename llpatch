@@ -581,7 +581,8 @@ function generate_thin_archive_txt()
 		return 0
 	fi
 
-	local -r __THIN_ARCHIVE_TXT="${G_TMP_DIR}/$(basename "${__THIN_ARCHIVE}").${G_SUFFIX_TAR}"
+	local -r __KLP_OBJ_ROOT="$(get_klp_obj_root "${__OBJ_PARENT}")"
+	local -r __THIN_ARCHIVE_TXT="${__KLP_OBJ_ROOT}/$(basename "${__THIN_ARCHIVE}").${G_SUFFIX_TAR}"
 	if [[ -f ${__THIN_ARCHIVE_TXT} ]]; then
 		eval "${__RETVAL}"="${__THIN_ARCHIVE_TXT}"
 		return 0
@@ -885,7 +886,7 @@ function package_build()
 	util::log_info "Build ${LIVEPATCH_OBJ} and resolve LLPatch symbols"
 	run_command "${BUILD_COMMAND[@]}" -C "${G_KDIR}" "${LIVEPATCH_OBJ}"
 
-	cat "${G_TMP_DIR}/"*".${G_SUFFIX_TAR}" >| "${G_TMP_TAR_FILE}"
+	cat *".${G_SUFFIX_TAR}" >| "${G_TMP_TAR_FILE}"
 	run_command "${G_LIVEPATCH_BIN}" fixup -q \
 				--symbol_map="${KLP_OBJ_ROOT}/${G_LLPATCH_SYMBOL_MAP_FILE}" \
 				--thin_archive="${G_TMP_TAR_FILE}" \
