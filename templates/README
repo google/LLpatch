@@ -11,5 +11,12 @@ livepatch. There are three files under this directory.
 3) Makefile.tmpl
    - makefile to build kernel livepatch.
 
+4) llpatch.h
+   - defines macro for LLpatch symbols
+
+5) llpatch-callbacks.c
+   - implements default callbacks for kernel livepatch
+   - this can be tweaked to implement customized callbacks
+
 Each template contains {{MARKER}} in it hoping that they are replaced by
 either `llpatch` or `livepatch gen` command.
