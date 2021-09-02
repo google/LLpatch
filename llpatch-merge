@@ -488,8 +488,11 @@ function build_livepatch()
 
 	run_command "${BUILD_COMMAND[@]}" -C "${G_KDIR}" "${LIVEPATCH_OBJ}"
 
-	# TODO: we need thin archive files here. need to add a new option to get dir for thin archives
-	>| "${G_TMP_TAR_FILE}"
+	local klp_dir=""
+	for klp_dir in ${G_KLP_DIRS[@]}; do
+		cat "${klp_dir}/"*".${G_SUFFIX_TAR}"
+	done >| "${G_TMP_TAR_FILE}"
+
 	run_command "${G_LIVEPATCH_BIN}" fixup -q \
 				--symbol_map="${G_TMP_DIR}/${G_LLPATCH_SYMBOL_MAP_FILE}" \
 				--thin_archive="${G_TMP_TAR_FILE}" \

@@ -21,16 +21,32 @@ These are important benefits:
    source-level diff, LLpatch uses LLVM IR for diffing to abstract away all the
    specifics/details on machine architecture, types of linkers, and kernel version.
 
-2. **Slim Livepatch**: LLpatch uses 'llvm-diff' to perform the diffing and generates LLVM IR
+2. **Easy Callbacks and LLpatch Symbols**: LLpatch helps the livepatch developer implement
+   four callbacks before/after patching/unpatching the livepatch. The developer can
+   implement those callbacks in their local .c file and feed the file to LLpatch. In
+   addition, in their callbacks, LLpatch provies simple macros to access global varaibles
+   (it doesn't matter if they are local static or not) defined in kernel modules and/or
+   vmlinux on a "running" machine. This helps and simplifies development for kernel
+   livepatch.
+
+3. **Slim Livepatch**: LLpatch uses 'llvm-diff' to perform the diffing and generates LLVM IR
    code that distills the differences. This allows compiler-backend to fully optimize a
    final ELF binary for kernel livepatch. (e.g., no redundant global variables not used in
    livepatch.
 
-3. **Better Checking and Validation**: LLVM IR contains much more information than ELF
+4. **Better Checking and Validation**: LLVM IR contains much more information than ELF
    binary. So, it's possible to implement lots of useful checking and validation mechanism
    for livepatch generation. (e.g., changes in function prototype should not be allowed.)
 
-4. **Semi-Automatic Livepatch Generation and Easy Debugging**
+5. **Ultra-Fast Livepatch Generation and Unchanged Kernel Repository**
+   + LLpatch doesn't require special compiler options for the diffing. So the kernel
+     doesn't need to be re-compiled.
+   + Assuming that a kernel repository is already built, LLpatch parses a .patch file to
+     figure out what files are changed by the .patch file. Compile options are derived
+     from \*.o.cmd files. For a simple livepatch generation, LLpatch takes just a few
+     seconds.
+
+6. **Semi-Automatic Livepatch Generation and Easy Debugging**
    + LLpatch respects Unix philasophy, "One command does one task very well." To this end,
      LLpatch implements small commands (livepatch, llpatch-merge, livepatch-compile,
      update-patch, ...)  that runs one task very well. `llpatch` puts them together to
@@ -42,15 +58,7 @@ These are important benefits:
      generation doesn't go through smoothly, developer can have enough information for
      reproducing and debugging the bug.
 
-5. **Ultra-Fast Livepatch Generation and Unchanged Kernel Repository**
-   + LLpatch doesn't require special compiler options for the diffing. So, kernel doesn't
-     need to be re-compiled differently.
-   + Assuming that kernel repository is already built, LLpatch parses .patch file to
-     figure out what files are changed by the .patch file. Compile options are derived
-     from \*.o.cmd files. For a simple livepatch generation, LLpatch takes just few
-     seconds.
-
-6. **Handling Duplicate Symbol Names**
+7. **Handling Duplicate Symbol Names**
    + LLpatch makes use of thin archive to resolve duplicate symbol names when generating
      kernel livepatch. This greatly simplies logic for the symbol handling.
 
@@ -88,7 +96,7 @@ source codes for LLpatch uses c++17 standard. Hence, please install clang
 
 LLpatch generates and parses LLVM IR for the livepatch generation. To this
 end, LLpatch requires LLVM library. Current LLpatch is implemented with
-llvm-11 library. This is a package name for llvm-11.
+llvm-11 (or later) library. This is a package name for llvm-11.
 
 - Ubuntu: llvm-11-dev
 - ...
@@ -200,18 +208,20 @@ File: .patch file to use for the livepatch package build.
       The patch is applied temporarily to kernel.
 
 Options:
-  --arch       CPU architecture for livepatch. arm64 and x86_64 are supported.
-               Default is x86_64.
-  -h, --help   This help message.
-  -k, --kdir   Path to kernel repository. If not specified, $CWD is used.
-  -o, --odir   Path to output directory. If not specified, '/pkgs' is used.
+  --arch            CPU architecture for livepatch. arm64 and x86_64 are supported.
+                    Default is x86_64.
+  -c, --callbacks   .c file implementing callbacks for livepatch
+                    Find templates/llpatch-callbacks.c and tweak it
+  -h, --help        This help message.
+  -k, --kdir        Path to kernel repository. If not specified, $CWD is used.
+  -o, --odir        Path to output directory. If not specified, '/pkgs' is used.
 
-Developer Options:      (for internal testing, not production use)
-  --multi               Allow changes in multiple kmods and/or vmlinux
-                        This is highly discouraged option to avoid "large" livepatch
-  --skip-pkg-build      Produce livepatch-<diffname>.ko rather than livepatch package
-  --slow-path           use kbuild to build llvm ir files
-  --debug-dir           Dir for debugging with all intermediate files for klp generation
+Developer Options:  (for internal testing, not production use)
+  --multi           Allow changes in multiple kmods and/or vmlinux
+                    This is highly discouraged option to avoid "large" livepatch
+  --skip-pkg-build  Produce livepatch-<diffname>.ko rather than livepatch package
+  --slow-path       use kbuild to build llvm ir files
+  --debug-dir       Dir for debugging with all intermediate files for klp generation
 
 
 # generates kernel livepatch for x86_64 platform and creates binary package, 
@@ -220,6 +230,10 @@ Developer Options:      (for internal testing, not production use)
 # is assumed to be ${kdir}
 $ ${path_to_llpatch}/llpatch --kdir=${kdir} ${patch_file}
 
+# generates kernel livepatch for x86_64 platform and creates binary package.
+# ${callback.c} is used for the callbacks for kernel livepatch.
+# Find example code under $llpatch/examples.
+$ ${path_to_llpatch}/llpatch --callbacks=${callback.c} ${patch_file}
 
 # generates kernel livepatch for arm64 platform and creates binary package, 
 # tarball, under ${klp_dir}
